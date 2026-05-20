@@ -1,0 +1,398 @@
+{% extends "_layout.html" %}
+{% block title %}Data recording · npu-classifier{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Data recording</h1>
+  </div>
+</div>
+
+<!-- Existing labels -->
+<section class="card">
+  <div class="card-header">
+    <h2 class="card-title">Existing data</h2>
+    <div class="card-desc">CSV files discovered in the <code>data/</code> directory.</div>
+  </div>
+  <div class="card-content" style="padding: 0;">
+    <div id="labels-empty" class="empty" style="margin: 20px;">No recordings yet — capture one below.</div>
+    <table class="table" id="labels-table" style="display: none;">
+      <thead>
+        <tr>
+          <th>Label</th>
+          <th class="num">Samples</th>
+          <th class="num">Duration</th>
+          <th class="num">Size</th>
+          <th>Last modified</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- New recording -->
+<section class="card">
+  <div class="card-header">
+    <h2 class="card-title">New recording</h2>
+    <div class="card-desc">Name a label, set a duration, hit start.</div>
+  </div>
+  <div class="card-content">
+    <div class="form-grid">
+      <div class="field">
+        <label class="label" for="rec-name">Name</label>
+        <input class="input" id="rec-name" type="text" placeholder="e.g. steady, shake, circle"
+               autocomplete="off" maxlength="64">
+        <div class="helper" id="rec-name-helper">
+          Saved to <code id="rec-name-preview">data/&lt;name&gt;.bin</code>.
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="label" for="rec-port">Sensor port</label>
+        <select class="select" id="rec-port"></select>
+        <div class="helper" id="rec-port-helper"></div>
+      </div>
+
+      <div class="field">
+        <label class="label">Mode</label>
+        <div class="segmented" id="rec-mode" data-value="append">
+          <button type="button" data-mode="append" class="active">Append</button>
+          <button type="button" data-mode="overwrite">Overwrite</button>
+        </div>
+        <div class="helper" id="rec-mode-helper">
+          Append adds rows to an existing file. Overwrite replaces it.
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="label">Duration</label>
+        <div class="field-row">
+          <div class="field" style="gap: 4px;">
+            <label class="helper" for="rec-seconds">Seconds</label>
+            <input class="input" id="rec-seconds" type="number" min="0.13" step="0.1" value="5">
+          </div>
+          <div class="field" style="gap: 4px;">
+            <label class="helper" for="rec-samples">Samples</label>
+            <input class="input" id="rec-samples" type="number" min="{{ min_samples }}" step="1">
+          </div>
+        </div>
+        <div class="helper" id="rec-duration-helper">@ {{ sample_rate }} Hz · minimum {{ min_samples }} samples (one inference window).</div>
+      </div>
+
+      <div style="display: flex; gap: 10px; margin-top: 4px;">
+        <button class="btn btn-primary" id="rec-start" disabled>Start recording</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Live progress -->
+<section class="card" id="progress-card" style="display: none;">
+  <div class="card-header">
+    <h2 class="card-title">Recording in progress</h2>
+    <div class="card-desc" id="progress-subtitle">—</div>
+  </div>
+  <div class="card-content">
+    <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
+    <div class="kv">
+      <div><span class="k">Elapsed</span><span class="v" id="progress-elapsed">0.0 s</span></div>
+      <div><span class="k">Samples</span><span class="v" id="progress-samples">0 / 0</span></div>
+      <div><span class="k">Progress</span><span class="v" id="progress-percent">0%</span></div>
+      <div><span class="k">Port</span><span class="v" id="progress-port">—</span></div>
+    </div>
+    <div style="margin-top: 14px;">
+      <button class="btn btn-secondary" id="rec-cancel">Cancel</button>
+    </div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script type="module">
+import { setIfChanged, fmtNumber, fmtBytes, fmtRelative, showToast } from "{{ url_for('static', filename='app.js') }}";
+
+const SAMPLE_RATE = {{ sample_rate }};
+const MIN_SAMPLES = {{ min_samples }};
+
+// --- Element refs ---
+const nameEl       = document.getElementById("rec-name");
+const namePreview  = document.getElementById("rec-name-preview");
+const portEl       = document.getElementById("rec-port");
+const portHelper   = document.getElementById("rec-port-helper");
+const modeEl       = document.getElementById("rec-mode");
+const secondsEl    = document.getElementById("rec-seconds");
+const samplesEl    = document.getElementById("rec-samples");
+const durHelper    = document.getElementById("rec-duration-helper");
+const startBtn     = document.getElementById("rec-start");
+const cancelBtn    = document.getElementById("rec-cancel");
+
+const progressCard    = document.getElementById("progress-card");
+const progressBar     = document.getElementById("progress-bar");
+const progressSub     = document.getElementById("progress-subtitle");
+const progressElapsed = document.getElementById("progress-elapsed");
+const progressSamples = document.getElementById("progress-samples");
+const progressPercent = document.getElementById("progress-percent");
+const progressPort    = document.getElementById("progress-port");
+
+const labelsTable = document.getElementById("labels-table");
+const labelsEmpty = document.getElementById("labels-empty");
+
+// --- State ---
+let availablePorts = [];
+let statusES = null;
+// Tracks the previous session status so we only fire completion/cancel/error
+// toasts on the active -> terminal transition, not on every 1 Hz SSE tick.
+let prevStatus = null;
+
+// --- Client-side elapsed timer ---
+// Elapsed is computed here, not taken from server's elapsed_s, so the counter
+// always reads clean integers (1, 2, 3 …) and starts exactly when recording starts.
+let _timerInterval = null;
+let _sessionStartMs  = null;
+
+function _tickElapsed() {
+  if (_sessionStartMs === null) return;
+  const secs = Math.max(0, Math.floor((Date.now() - _sessionStartMs) / 1000));
+  progressElapsed.textContent = `${secs} s`;
+}
+
+function startClientTimer(startedAtMs) {
+  stopClientTimer();
+  _sessionStartMs = startedAtMs;
+  _tickElapsed();                              // paint 0 s immediately
+  _timerInterval = setInterval(_tickElapsed, 1000);
+}
+
+function stopClientTimer() {
+  if (_timerInterval !== null) {
+    clearInterval(_timerInterval);
+    _timerInterval = null;
+  }
+  _sessionStartMs = null;
+}
+
+// --- Name input ---
+function sanitizePreview(raw) {
+  const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
+  return cleaned;
+}
+function updateNamePreview() {
+  const cleaned = sanitizePreview(nameEl.value);
+  namePreview.textContent = cleaned ? `data/${cleaned}.bin` : "data/<name>.bin";
+  refreshStartEnabled();
+}
+nameEl.addEventListener("input", updateNamePreview);
+
+// --- Duration linkage ---
+function setSamplesFromSeconds() {
+  const s = parseFloat(secondsEl.value);
+  if (!Number.isFinite(s) || s <= 0) return;
+  samplesEl.value = Math.max(MIN_SAMPLES, Math.round(s * SAMPLE_RATE));
+  refreshStartEnabled();
+}
+function setSecondsFromSamples() {
+  const n = parseInt(samplesEl.value, 10);
+  if (!Number.isFinite(n) || n <= 0) return;
+  secondsEl.value = (n / SAMPLE_RATE).toFixed(2);
+  refreshStartEnabled();
+}
+secondsEl.addEventListener("input", setSamplesFromSeconds);
+samplesEl.addEventListener("input", setSecondsFromSamples);
+setSamplesFromSeconds();   // seed initial samples value from default 5 s
+
+// --- Mode segmented ---
+modeEl.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-mode]");
+  if (!btn) return;
+  for (const b of modeEl.querySelectorAll("button")) b.classList.remove("active");
+  btn.classList.add("active");
+  modeEl.dataset.value = btn.dataset.mode;
+});
+
+// --- Start enabled gate ---
+function refreshStartEnabled() {
+  const cleaned = sanitizePreview(nameEl.value);
+  const samples = parseInt(samplesEl.value, 10);
+  const ok = !!cleaned
+          && Number.isFinite(samples) && samples >= MIN_SAMPLES
+          && availablePorts.length > 0;
+  startBtn.disabled = !ok;
+}
+
+// --- Recordings table ---
+async function refreshRecordings() {
+  const r = await fetch("/api/recordings");
+  if (!r.ok) return;
+  const data = await r.json();
+
+  // Update port select
+  availablePorts = data.ports || [];
+  const prev = portEl.value;
+  portEl.innerHTML = "";
+  if (availablePorts.length === 0) {
+    const opt = document.createElement("option");
+    opt.textContent = "no sensors connected";
+    opt.disabled = true;
+    portEl.appendChild(opt);
+    portEl.disabled = true;
+    portHelper.className = "helper warn";
+    portHelper.textContent = "No sensors detected. Edit ALLOWED_PORTS in sensor_reader.py.";
+  } else {
+    portEl.disabled = false;
+    portHelper.className = "helper";
+    portHelper.textContent = `${availablePorts.length} port${availablePorts.length === 1 ? "" : "s"} available.`;
+    for (const p of availablePorts) {
+      const opt = document.createElement("option");
+      opt.value = p;
+      opt.textContent = p;
+      portEl.appendChild(opt);
+    }
+    if (prev && availablePorts.includes(prev)) portEl.value = prev;
+  }
+
+  // Update labels table
+  const labels = data.labels || [];
+  const tbody = labelsTable.querySelector("tbody");
+  tbody.innerHTML = "";
+  if (labels.length === 0) {
+    labelsTable.style.display = "none";
+    labelsEmpty.style.display = "";
+  } else {
+    labelsTable.style.display = "";
+    labelsEmpty.style.display = "none";
+    for (const l of labels) {
+      const tr = document.createElement("tr");
+      const dur = (l.samples / SAMPLE_RATE);
+      tr.innerHTML = `
+        <td><strong>${l.name}</strong></td>
+        <td class="num">${fmtNumber(l.samples)}</td>
+        <td class="num">${dur.toFixed(1)} s</td>
+        <td class="num">${fmtBytes(l.file_size)}</td>
+        <td>${fmtRelative(l.mtime)}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
+  refreshStartEnabled();
+}
+
+// --- Progress rendering ---
+function renderProgress(s) {
+  if (!s || s.status !== "active") {
+    progressCard.style.display = "none";
+    return;
+  }
+  progressCard.style.display = "";
+  const pct = Math.round((s.progress || 0) * 100);
+  progressBar.style.width = pct + "%";
+  progressSub.textContent = `${s.name} · ${s.mode} · target ${fmtNumber(s.target_samples)} samples`;
+  // progressElapsed is owned by the client-side timer — don't touch it here.
+  progressSamples.textContent = `${fmtNumber(s.samples_written)} / ${fmtNumber(s.target_samples)}`;
+  progressPercent.textContent = `${pct}%`;
+  progressPort.textContent = s.port || "—";
+}
+
+// Server-pushed status updates at strict 1 Hz over SSE. Replaces the previous
+// 2 Hz polling — fewer Flask wakeups, no per-tick HTTP overhead, no terminal
+// access-log spam during recording.
+function handleSessionUpdate(s) {
+  const curStatus = s ? s.status : null;
+
+  if (s && s.status === "active") {
+    renderProgress(s);
+    startBtn.disabled = true;
+    // Start the client timer if not already running. On page reload mid-recording
+    // we reconstruct the start time from the server's started_ts so the counter
+    // continues from the correct value (e.g. "7 s") rather than resetting to 0.
+    if (_timerInterval === null) {
+      startClientTimer(s.started_ts * 1000);
+    }
+  } else {
+    renderProgress(null);
+    stopClientTimer();
+    refreshStartEnabled();
+  }
+
+  // Only react to active -> terminal transitions. Page-load with a stale
+  // _last_finished session would otherwise re-fire toasts on every reload.
+  if (prevStatus === "active" && curStatus !== "active" && s) {
+    if (curStatus === "complete") {
+      showToast(`Saved ${s.file_path} (${fmtNumber(s.samples_written)} samples)`);
+      refreshRecordings();
+    } else if (curStatus === "cancelled") {
+      showToast(`Cancelled — kept ${fmtNumber(s.samples_written)} samples in ${s.file_path}`);
+      refreshRecordings();
+    } else if (curStatus === "error") {
+      showToast(`Error: ${s.error || "unknown"}`, { error: true, durationMs: 6000 });
+      refreshRecordings();
+    }
+  }
+
+  prevStatus = curStatus;
+}
+
+function connectStatusStream() {
+  if (statusES != null) return;
+  statusES = new EventSource("/api/record/stream");
+  statusES.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      handleSessionUpdate(data.session);
+    } catch (err) {
+      console.warn("bad SSE message:", err);
+    }
+  };
+  statusES.onerror = () => {
+    // EventSource auto-reconnects with backoff; nothing to do here beyond logging.
+    console.warn("status stream errored, EventSource will auto-reconnect");
+  };
+}
+
+// --- Start / cancel handlers ---
+startBtn.addEventListener("click", async () => {
+  const name = sanitizePreview(nameEl.value);
+  const target_samples = parseInt(samplesEl.value, 10);
+  const port = portEl.value;
+  const mode = modeEl.dataset.value || "append";
+
+  startBtn.disabled = true;
+  try {
+    const r = await fetch("/api/record/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, target_samples, port, mode }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      showToast(data.error || "Failed to start", { error: true });
+      refreshStartEnabled();
+      return;
+    }
+    renderProgress(data.session);
+    // Start the timer immediately from the POST response so the display
+    // reads "0 s" right away rather than waiting up to 1 s for the first SSE tick.
+    startClientTimer(Date.now());
+    // SSE will deliver progress ticks; handleSessionUpdate sees the timer
+    // already running and won't reset it.
+  } catch (err) {
+    showToast(String(err), { error: true });
+    refreshStartEnabled();
+  }
+});
+
+cancelBtn.addEventListener("click", async () => {
+  await fetch("/api/record/cancel", { method: "POST" });
+  // The next SSE tick will deliver the cancelled status and fire the toast.
+});
+
+// --- Bootstrap ---
+(async function init() {
+  await refreshRecordings();
+  // SSE delivers the initial state immediately, then ticks once per second.
+  // Handles the page-reload-mid-recording case without an extra fetch.
+  connectStatusStream();
+})();
+</script>
+{% endblock %}

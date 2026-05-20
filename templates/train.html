@@ -1,0 +1,302 @@
+{% extends "_layout.html" %}
+{% block title %}Train model · npu-classifier{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Train model</h1>
+  </div>
+</div>
+
+<!-- Backbone + head status -->
+<section class="card">
+  <div class="card-header">
+    <h2 class="card-title">Status</h2>
+    <div class="card-desc">Current backbone and head artifacts.</div>
+  </div>
+  <div class="card-content">
+    <div class="kv">
+      <div>
+        <span class="k">Backbone</span>
+        <span class="v" id="status-backbone">{{ backbone_variant if backbone_present else 'missing' }}</span>
+      </div>
+      <div>
+        <span class="k">Backbone mode</span>
+        <span class="v" id="status-backbone-mode">—</span>
+      </div>
+      <div>
+        <span class="k">Current head</span>
+        <span class="v" id="status-head">
+          {%- if head_labels -%}
+            {{ head_labels|length }} labels — {{ head_labels|join(', ') }}
+          {%- else -%}
+            untrained
+          {%- endif -%}
+        </span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Training data picker -->
+<section class="card">
+  <div class="card-header">
+    <h2 class="card-title">Training data</h2>
+  </div>
+  <div class="card-content" style="padding: 0;">
+    <div id="labels-empty" class="empty" style="margin: 20px;">No recordings yet — capture some via Data recording.</div>
+    <table class="table" id="labels-table" style="display: none;">
+      <thead>
+        <tr>
+          <th style="width: 36px;">
+            <input type="checkbox" id="check-all" title="Select all eligible">
+          </th>
+          <th>Label</th>
+          <th class="num">Samples</th>
+          <th class="num">Windows</th>
+          <th>Eligible</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div class="card-content" style="border-top: 1px solid var(--border); display: flex; align-items: center; gap: 16px;">
+    <button class="btn btn-primary" id="train-start" disabled>Train model</button>
+    <div class="helper" id="train-selected">Select at least 2 eligible labels.</div>
+  </div>
+</section>
+
+<!-- Live progress -->
+<section class="card" id="progress-card" style="display: none;">
+  <div class="card-header">
+    <h2 class="card-title">Training in progress</h2>
+    <div class="card-desc" id="progress-subtitle">—</div>
+  </div>
+  <div class="card-content">
+    <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
+    <div class="kv">
+      <div><span class="k">Current label</span><span class="v" id="progress-current">—</span></div>
+      <div><span class="k">Labels done</span><span class="v" id="progress-done">0 / 0</span></div>
+      <div><span class="k">Elapsed</span><span class="v" id="progress-elapsed">0.0 s</span></div>
+    </div>
+    <div style="margin-top: 14px;">
+      <button class="btn btn-secondary" id="train-cancel">Cancel</button>
+    </div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script type="module">
+import { fmtNumber, fmtRelative, showToast } from "{{ url_for('static', filename='app.js') }}";
+
+const MIN_WINDOWS = {{ min_windows }};
+const WINDOW_SIZE = {{ window_size }};
+const SAMPLE_RATE = {{ sample_rate }};
+const PRE_CHECKED_LABELS = new Set({{ head_labels|tojson }});
+
+const labelsTable      = document.getElementById("labels-table");
+const labelsEmpty      = document.getElementById("labels-empty");
+const checkAll         = document.getElementById("check-all");
+const trainStartBtn    = document.getElementById("train-start");
+const trainCancelBtn   = document.getElementById("train-cancel");
+const trainSelectedEl  = document.getElementById("train-selected");
+
+const progressCard     = document.getElementById("progress-card");
+const progressBar      = document.getElementById("progress-bar");
+const progressSub      = document.getElementById("progress-subtitle");
+const progressCurrent  = document.getElementById("progress-current");
+const progressDone     = document.getElementById("progress-done");
+const progressElapsed  = document.getElementById("progress-elapsed");
+
+const statusHeadEl         = document.getElementById("status-head");
+const statusBackboneEl     = document.getElementById("status-backbone");
+const statusBackboneModeEl = document.getElementById("status-backbone-mode");
+
+let labelsCache = [];
+let pollHandle = null;
+
+function selectedLabels() {
+  return labelsCache.filter(l => {
+    const cb = document.querySelector(`input[data-label="${l.name}"]`);
+    return cb && cb.checked && !cb.disabled;
+  }).map(l => l.name);
+}
+
+function refreshSelectedSummary() {
+  const picked = selectedLabels();
+  if (picked.length < 2) {
+    trainStartBtn.disabled = true;
+    trainSelectedEl.textContent = "Select at least 2 eligible labels.";
+    return;
+  }
+  const totalWindows = labelsCache
+    .filter(l => picked.includes(l.name))
+    .reduce((acc, l) => acc + (l.windows || 0), 0);
+  trainStartBtn.disabled = false;
+  trainSelectedEl.textContent =
+    `Selected: ${picked.length} labels · ${fmtNumber(totalWindows)} windows total ` +
+    `(~${(totalWindows * WINDOW_SIZE / SAMPLE_RATE).toFixed(1)} s of data).`;
+}
+
+async function refreshLabels() {
+  const r = await fetch("/api/recordings");
+  if (!r.ok) return;
+  const data = await r.json();
+  labelsCache = data.labels || [];
+
+  const tbody = labelsTable.querySelector("tbody");
+  tbody.innerHTML = "";
+  if (labelsCache.length === 0) {
+    labelsTable.style.display = "none";
+    labelsEmpty.style.display = "";
+  } else {
+    labelsTable.style.display = "";
+    labelsEmpty.style.display = "none";
+    for (const l of labelsCache) {
+      const tr = document.createElement("tr");
+      const eligible = !!l.eligible;
+      const wasInPriorHead = PRE_CHECKED_LABELS.has(l.name);
+      // Default-check: re-train the existing head's labels if any, else all eligible.
+      const wantChecked = eligible && (PRE_CHECKED_LABELS.size === 0 || wasInPriorHead);
+
+      tr.innerHTML = `
+        <td>
+          <input type="checkbox" data-label="${l.name}"
+                 ${eligible ? "" : "disabled"}
+                 ${wantChecked ? "checked" : ""}
+                 title="${eligible ? '' : `needs ≥ ${MIN_WINDOWS} windows — record more via /record`}">
+        </td>
+        <td><strong>${l.name}</strong></td>
+        <td class="num">${fmtNumber(l.samples)}</td>
+        <td class="num">${fmtNumber(l.windows || 0)}</td>
+        <td>${eligible ? '<span class="badge npu">eligible</span>'
+                       : `<span class="badge stub">needs ${MIN_WINDOWS}+</span>`}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+    // Bind change handlers
+    for (const cb of tbody.querySelectorAll("input[type=checkbox]")) {
+      cb.addEventListener("change", refreshSelectedSummary);
+    }
+  }
+  refreshSelectedSummary();
+}
+
+checkAll.addEventListener("change", () => {
+  const want = checkAll.checked;
+  for (const cb of labelsTable.querySelectorAll("input[type=checkbox][data-label]")) {
+    if (!cb.disabled) cb.checked = want;
+  }
+  refreshSelectedSummary();
+});
+
+async function refreshStatus() {
+  const r = await fetch("/api/train/status");
+  if (!r.ok) return;
+  const data = await r.json();
+  const head = data.head_labels || [];
+  const colors = data.head_colors || {};
+  if (head.length) {
+    // Render each label with its current colour swatch.
+    statusHeadEl.innerHTML = `${head.length} labels — ` + head.map(name => {
+      const slot = colors[name];
+      const swatchClass = (slot == null || slot < 0) ? "" : `color-${slot}`;
+      return `<span class="swatch ${swatchClass}"></span>${name}`;
+    }).join(", &nbsp;");
+  } else {
+    statusHeadEl.textContent = "untrained";
+  }
+  statusBackboneEl.textContent = data.backbone || "missing";
+  statusBackboneModeEl.textContent = data.backbone_mode || "stub";
+  return data;
+}
+
+function renderProgress(s) {
+  if (!s || s.status !== "active") {
+    progressCard.style.display = "none";
+    return;
+  }
+  progressCard.style.display = "";
+  const pct = Math.round((s.progress || 0) * 100);
+  progressBar.style.width = pct + "%";
+  progressSub.textContent = `Selected: ${s.selected_labels.join(", ")}`;
+  progressCurrent.textContent = s.current_label || "—";
+  progressDone.textContent = `${s.labels_done} / ${s.labels_total}`;
+  progressElapsed.textContent = `${(s.elapsed_s || 0).toFixed(1)} s`;
+}
+
+async function pollStatus() {
+  const data = await refreshStatus();
+  if (!data) return;
+  const s = data.session;
+  if (s && s.status === "active") {
+    renderProgress(s);
+    trainStartBtn.disabled = true;
+  } else {
+    renderProgress(null);
+    stopPolling();
+    refreshSelectedSummary();
+    if (s) {
+      if (s.status === "complete") {
+        showToast(`Trained on labels: ${s.selected_labels.join(", ")}`);
+        await refreshLabels();
+      } else if (s.status === "cancelled") {
+        showToast("Training cancelled");
+      } else if (s.status === "error") {
+        showToast(`Training failed: ${s.error || "unknown"}`, { error: true, durationMs: 6000 });
+      }
+    }
+  }
+}
+
+function startPolling() {
+  if (pollHandle != null) return;
+  pollHandle = setInterval(pollStatus, 500);
+  pollStatus();
+}
+function stopPolling() {
+  if (pollHandle != null) { clearInterval(pollHandle); pollHandle = null; }
+}
+
+trainStartBtn.addEventListener("click", async () => {
+  const labels = selectedLabels();
+  trainStartBtn.disabled = true;
+  try {
+    const r = await fetch("/api/train/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ labels }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      showToast(data.error || "Failed to start", { error: true });
+      refreshSelectedSummary();
+      return;
+    }
+    renderProgress(data.session);
+    startPolling();
+  } catch (err) {
+    showToast(String(err), { error: true });
+    refreshSelectedSummary();
+  }
+});
+
+trainCancelBtn.addEventListener("click", async () => {
+  await fetch("/api/train/cancel", { method: "POST" });
+  pollStatus();
+});
+
+(async function init() {
+  await refreshLabels();
+  await refreshStatus();
+  // Pick up an in-progress session if we landed mid-training.
+  const r = await fetch("/api/train/status");
+  const data = await r.json();
+  if (data.session && data.session.status === "active") {
+    renderProgress(data.session);
+    startPolling();
+  }
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,164 @@
+{% extends "_layout.html" %}
+{% block title %}Live inference · npu-classifier{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Live inference</h1>
+    <div class="page-subtitle">
+      <span id="updated">never</span>.
+    </div>
+  </div>
+</div>
+
+<div id="cards" class="grid"></div>
+
+<template id="card-tpl">
+  <div class="card port-card">
+    <div class="card-content">
+      <div class="port"></div>
+      <div class="label-line idle" data-label>—</div>
+      <div class="conf" data-conf>waiting…</div>
+      <div class="strip-label">last {{ rolling_window }}</div>
+      <div class="strip" data-strip></div>
+      <div class="age" data-age></div>
+    </div>
+  </div>
+</template>
+{% endblock %}
+
+{% block scripts %}
+<script type="module">
+import { setIfChanged } from "{{ url_for('static', filename='app.js') }}";
+
+// SSE-driven live update — see project2 for the full design notes. The server
+// pushes a snapshot the instant a port latches; the page re-renders only the
+// cells that actually changed.
+
+const cards = document.getElementById("cards");
+const sidebarModeEl = document.getElementById("sidebar-mode");
+const updatedEl = document.getElementById("updated");
+const tpl = document.getElementById("card-tpl");
+const portCards = new Map();
+const lastDisplaySeq = new Map();
+// label name -> color slot (0..9), populated from each /api/stream snapshot.
+let labelColors = {};
+
+function classFor(name) {
+  // "untrained" / "stub" / unknown → idle gray. Otherwise the snapshot's
+  // label_colors map tells us which palette slot (0..9) to use.
+  if (name == null || name === "untrained" || name === "stub") return "idle";
+  const slot = labelColors[name];
+  if (slot == null || slot < 0) return "idle";
+  return "color-" + slot;
+}
+
+function ensureCard(port) {
+  if (portCards.has(port)) return portCards.get(port);
+  const node = tpl.content.firstElementChild.cloneNode(true);
+  node.querySelector(".port").textContent = port;
+  const stripEl = node.querySelector("[data-strip]");
+  for (let i = 0; i < {{ rolling_window }}; i++) {
+    const dot = document.createElement("div");
+    dot.className = "dot";
+    stripEl.appendChild(dot);
+  }
+  cards.appendChild(node);
+  portCards.set(port, node);
+  return node;
+}
+
+function renderCard(port, entry) {
+  const card = ensureCard(port);
+  const labelEl = card.querySelector("[data-label]");
+  const confEl  = card.querySelector("[data-conf]");
+  const stripEl = card.querySelector("[data-strip]");
+  const ageEl   = card.querySelector("[data-age]");
+
+  if (!entry.majority_class_name) {
+    setIfChanged(labelEl, "textContent", "—");
+    setIfChanged(labelEl, "className", "label-line idle");
+    setIfChanged(confEl, "textContent", "waiting for first 5 inferences…");
+    setIfChanged(ageEl, "textContent", "");
+    for (const dot of stripEl.children) {
+      setIfChanged(dot, "className", "dot");
+    }
+    return;
+  }
+
+  setIfChanged(labelEl, "textContent", entry.majority_class_name);
+  setIfChanged(labelEl, "className", "label-line " + classFor(entry.majority_class_name));
+
+  const latestConf = entry.recent && entry.recent.length
+    ? entry.recent[entry.recent.length - 1].confidence : null;
+  const confPct = latestConf == null ? "—" : (latestConf * 100).toFixed(0) + "%";
+  setIfChanged(confEl, "textContent",
+    `latest confidence ${confPct} · majority ${entry.majority_count}/${entry.window_count}`);
+
+  const recent = entry.recent || [];
+  const dots = stripEl.children;
+  for (let i = 0; i < {{ rolling_window }}; i++) {
+    const dot = dots[i];
+    const desired = i < recent.length ? "dot " + classFor(recent[i].class_name) : "dot";
+    setIfChanged(dot, "className", desired);
+  }
+
+  setIfChanged(ageEl, "textContent",
+    `latest reading ${entry.latest_age_ms == null ? "—" : entry.latest_age_ms + "ms"} ago`);
+}
+
+function renderEmpty(mode) {
+  cards.innerHTML = '<div class="empty">No sensors connected (check <code>ALLOWED_PORTS</code> in <code>sensor_reader.py</code>).</div>';
+  cards.dataset.empty = "1";
+  portCards.clear();
+  lastDisplaySeq.clear();
+  if (mode) {
+    setIfChanged(sidebarModeEl, "textContent", mode);
+    sidebarModeEl.className = "badge " + mode;
+  }
+}
+
+function handleSnapshot(data) {
+  // Refresh the label→color map on every snapshot so a retrain mid-session
+  // takes effect on the very next dot/label render.
+  if (data.label_colors) labelColors = data.label_colors;
+
+  const ports = data.ports || {};
+  const portNames = Object.keys(ports);
+
+  if (portNames.length === 0) {
+    if (cards.dataset.empty !== "1") renderEmpty(data.inference_mode);
+    return;
+  }
+  cards.dataset.empty = "0";
+
+  let anyChanged = false;
+  for (const port of portNames) {
+    const entry = ports[port];
+    const seq = entry.display_seq || 0;
+    if (lastDisplaySeq.get(port) === seq) continue;
+    lastDisplaySeq.set(port, seq);
+    renderCard(port, entry);
+    anyChanged = true;
+  }
+
+  if (anyChanged) {
+    setIfChanged(sidebarModeEl, "textContent", data.inference_mode || "?");
+    sidebarModeEl.className = "badge " + (data.inference_mode || "stub");
+    setIfChanged(updatedEl, "textContent", new Date().toLocaleTimeString());
+  }
+}
+
+const evt = new EventSource("/api/stream");
+evt.onmessage = (e) => {
+  try {
+    handleSnapshot(JSON.parse(e.data));
+  } catch (err) {
+    console.warn("SSE parse error:", err);
+  }
+};
+evt.onerror = () => {
+  console.warn("SSE connection dropped, reconnecting…");
+};
+</script>
+{% endblock %}
