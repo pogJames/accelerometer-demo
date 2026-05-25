@@ -12,7 +12,6 @@
 <section class="card">
   <div class="card-header">
     <h2 class="card-title">Existing data</h2>
-    <div class="card-desc">CSV files discovered in the <code>data/</code> directory.</div>
   </div>
   <div class="card-content" style="padding: 0;">
     <div id="labels-empty" class="empty" style="margin: 20px;">No recordings yet — capture one below.</div>
@@ -35,7 +34,6 @@
 <section class="card">
   <div class="card-header">
     <h2 class="card-title">New recording</h2>
-    <div class="card-desc">Name a label, set a duration, hit start.</div>
   </div>
   <div class="card-content">
     <div class="form-grid">
@@ -43,15 +41,11 @@
         <label class="label" for="rec-name">Name</label>
         <input class="input" id="rec-name" type="text" placeholder="e.g. steady, shake, circle"
                autocomplete="off" maxlength="64">
-        <div class="helper" id="rec-name-helper">
-          Saved to <code id="rec-name-preview">data/&lt;name&gt;.bin</code>.
-        </div>
       </div>
 
       <div class="field">
         <label class="label" for="rec-port">Sensor port</label>
         <select class="select" id="rec-port"></select>
-        <div class="helper" id="rec-port-helper"></div>
       </div>
 
       <div class="field">
@@ -59,9 +53,6 @@
         <div class="segmented" id="rec-mode" data-value="append">
           <button type="button" data-mode="append" class="active">Append</button>
           <button type="button" data-mode="overwrite">Overwrite</button>
-        </div>
-        <div class="helper" id="rec-mode-helper">
-          Append adds rows to an existing file. Overwrite replaces it.
         </div>
       </div>
 
@@ -77,7 +68,6 @@
             <input class="input" id="rec-samples" type="number" min="{{ min_samples }}" step="1">
           </div>
         </div>
-        <div class="helper" id="rec-duration-helper">@ {{ sample_rate }} Hz · minimum {{ min_samples }} samples (one inference window).</div>
       </div>
 
       <div style="display: flex; gap: 10px; margin-top: 4px;">
@@ -91,12 +81,11 @@
 <section class="card" id="progress-card" style="display: none;">
   <div class="card-header">
     <h2 class="card-title">Recording in progress</h2>
-    <div class="card-desc" id="progress-subtitle">—</div>
   </div>
   <div class="card-content">
     <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
     <div class="kv">
-      <div><span class="k">Elapsed</span><span class="v" id="progress-elapsed">0.0 s</span></div>
+      <div><span class="k">Elapsed</span><span class="v" id="progress-elapsed">0 s</span></div>
       <div><span class="k">Samples</span><span class="v" id="progress-samples">0 / 0</span></div>
       <div><span class="k">Progress</span><span class="v" id="progress-percent">0%</span></div>
       <div><span class="k">Port</span><span class="v" id="progress-port">—</span></div>
@@ -117,19 +106,15 @@ const MIN_SAMPLES = {{ min_samples }};
 
 // --- Element refs ---
 const nameEl       = document.getElementById("rec-name");
-const namePreview  = document.getElementById("rec-name-preview");
 const portEl       = document.getElementById("rec-port");
-const portHelper   = document.getElementById("rec-port-helper");
 const modeEl       = document.getElementById("rec-mode");
 const secondsEl    = document.getElementById("rec-seconds");
 const samplesEl    = document.getElementById("rec-samples");
-const durHelper    = document.getElementById("rec-duration-helper");
 const startBtn     = document.getElementById("rec-start");
 const cancelBtn    = document.getElementById("rec-cancel");
 
 const progressCard    = document.getElementById("progress-card");
 const progressBar     = document.getElementById("progress-bar");
-const progressSub     = document.getElementById("progress-subtitle");
 const progressElapsed = document.getElementById("progress-elapsed");
 const progressSamples = document.getElementById("progress-samples");
 const progressPercent = document.getElementById("progress-percent");
@@ -145,41 +130,12 @@ let statusES = null;
 // toasts on the active -> terminal transition, not on every 1 Hz SSE tick.
 let prevStatus = null;
 
-// --- Client-side elapsed timer ---
-// Elapsed is computed here, not taken from server's elapsed_s, so the counter
-// always reads clean integers (1, 2, 3 …) and starts exactly when recording starts.
-let _timerInterval = null;
-let _sessionStartMs  = null;
-
-function _tickElapsed() {
-  if (_sessionStartMs === null) return;
-  const secs = Math.max(0, Math.floor((Date.now() - _sessionStartMs) / 1000));
-  progressElapsed.textContent = `${secs} s`;
-}
-
-function startClientTimer(startedAtMs) {
-  stopClientTimer();
-  _sessionStartMs = startedAtMs;
-  _tickElapsed();                              // paint 0 s immediately
-  _timerInterval = setInterval(_tickElapsed, 1000);
-}
-
-function stopClientTimer() {
-  if (_timerInterval !== null) {
-    clearInterval(_timerInterval);
-    _timerInterval = null;
-  }
-  _sessionStartMs = null;
-}
-
 // --- Name input ---
 function sanitizePreview(raw) {
   const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
   return cleaned;
 }
 function updateNamePreview() {
-  const cleaned = sanitizePreview(nameEl.value);
-  namePreview.textContent = cleaned ? `data/${cleaned}.bin` : "data/<name>.bin";
   refreshStartEnabled();
 }
 nameEl.addEventListener("input", updateNamePreview);
@@ -236,12 +192,8 @@ async function refreshRecordings() {
     opt.disabled = true;
     portEl.appendChild(opt);
     portEl.disabled = true;
-    portHelper.className = "helper warn";
-    portHelper.textContent = "No sensors detected. Edit ALLOWED_PORTS in sensor_reader.py.";
   } else {
     portEl.disabled = false;
-    portHelper.className = "helper";
-    portHelper.textContent = `${availablePorts.length} port${availablePorts.length === 1 ? "" : "s"} available.`;
     for (const p of availablePorts) {
       const opt = document.createElement("option");
       opt.value = p;
@@ -287,8 +239,7 @@ function renderProgress(s) {
   progressCard.style.display = "";
   const pct = Math.round((s.progress || 0) * 100);
   progressBar.style.width = pct + "%";
-  progressSub.textContent = `${s.name} · ${s.mode} · target ${fmtNumber(s.target_samples)} samples`;
-  // progressElapsed is owned by the client-side timer — don't touch it here.
+  progressElapsed.textContent = `${Math.floor(s.elapsed_s || 0)} s`;
   progressSamples.textContent = `${fmtNumber(s.samples_written)} / ${fmtNumber(s.target_samples)}`;
   progressPercent.textContent = `${pct}%`;
   progressPort.textContent = s.port || "—";
@@ -303,15 +254,8 @@ function handleSessionUpdate(s) {
   if (s && s.status === "active") {
     renderProgress(s);
     startBtn.disabled = true;
-    // Start the client timer if not already running. On page reload mid-recording
-    // we reconstruct the start time from the server's started_ts so the counter
-    // continues from the correct value (e.g. "7 s") rather than resetting to 0.
-    if (_timerInterval === null) {
-      startClientTimer(s.started_ts * 1000);
-    }
   } else {
     renderProgress(null);
-    stopClientTimer();
     refreshStartEnabled();
   }
 
@@ -371,11 +315,6 @@ startBtn.addEventListener("click", async () => {
       return;
     }
     renderProgress(data.session);
-    // Start the timer immediately from the POST response so the display
-    // reads "0 s" right away rather than waiting up to 1 s for the first SSE tick.
-    startClientTimer(Date.now());
-    // SSE will deliver progress ticks; handleSessionUpdate sees the timer
-    // already running and won't reset it.
   } catch (err) {
     showToast(String(err), { error: true });
     refreshStartEnabled();

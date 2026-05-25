@@ -12,20 +12,11 @@
 <section class="card">
   <div class="card-header">
     <h2 class="card-title">Status</h2>
-    <div class="card-desc">Current backbone and head artifacts.</div>
   </div>
   <div class="card-content">
     <div class="kv">
       <div>
-        <span class="k">Backbone</span>
-        <span class="v" id="status-backbone">{{ backbone_variant if backbone_present else 'missing' }}</span>
-      </div>
-      <div>
-        <span class="k">Backbone mode</span>
-        <span class="v" id="status-backbone-mode">—</span>
-      </div>
-      <div>
-        <span class="k">Current head</span>
+        <span class="k">Current labels</span>
         <span class="v" id="status-head">
           {%- if head_labels -%}
             {{ head_labels|length }} labels — {{ head_labels|join(', ') }}
@@ -52,8 +43,7 @@
             <input type="checkbox" id="check-all" title="Select all eligible">
           </th>
           <th>Label</th>
-          <th class="num">Samples</th>
-          <th class="num">Windows</th>
+          <th class="num">Duration</th>
           <th>Eligible</th>
         </tr>
       </thead>
@@ -70,7 +60,6 @@
 <section class="card" id="progress-card" style="display: none;">
   <div class="card-header">
     <h2 class="card-title">Training in progress</h2>
-    <div class="card-desc" id="progress-subtitle">—</div>
   </div>
   <div class="card-content">
     <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
@@ -104,14 +93,11 @@ const trainSelectedEl  = document.getElementById("train-selected");
 
 const progressCard     = document.getElementById("progress-card");
 const progressBar      = document.getElementById("progress-bar");
-const progressSub      = document.getElementById("progress-subtitle");
 const progressCurrent  = document.getElementById("progress-current");
 const progressDone     = document.getElementById("progress-done");
 const progressElapsed  = document.getElementById("progress-elapsed");
 
-const statusHeadEl         = document.getElementById("status-head");
-const statusBackboneEl     = document.getElementById("status-backbone");
-const statusBackboneModeEl = document.getElementById("status-backbone-mode");
+const statusHeadEl = document.getElementById("status-head");
 
 let labelsCache = [];
 let pollHandle = null;
@@ -168,9 +154,8 @@ async function refreshLabels() {
                  title="${eligible ? '' : `needs ≥ ${MIN_WINDOWS} windows — record more via /record`}">
         </td>
         <td><strong>${l.name}</strong></td>
-        <td class="num">${fmtNumber(l.samples)}</td>
-        <td class="num">${fmtNumber(l.windows || 0)}</td>
-        <td>${eligible ? '<span class="badge npu">eligible</span>'
+        <td class="num">${(l.samples / SAMPLE_RATE).toFixed(1)} s</td>
+        <td>${eligible ? '<span class="badge npu">good</span>'
                        : `<span class="badge stub">needs ${MIN_WINDOWS}+</span>`}</td>
       `;
       tbody.appendChild(tr);
@@ -207,8 +192,6 @@ async function refreshStatus() {
   } else {
     statusHeadEl.textContent = "untrained";
   }
-  statusBackboneEl.textContent = data.backbone || "missing";
-  statusBackboneModeEl.textContent = data.backbone_mode || "stub";
   return data;
 }
 
@@ -220,7 +203,6 @@ function renderProgress(s) {
   progressCard.style.display = "";
   const pct = Math.round((s.progress || 0) * 100);
   progressBar.style.width = pct + "%";
-  progressSub.textContent = `Selected: ${s.selected_labels.join(", ")}`;
   progressCurrent.textContent = s.current_label || "—";
   progressDone.textContent = `${s.labels_done} / ${s.labels_total}`;
   progressElapsed.textContent = `${(s.elapsed_s || 0).toFixed(1)} s`;

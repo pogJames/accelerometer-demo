@@ -180,7 +180,6 @@ def build_app():
                     "window_count": 0,
                     "recent": [],
                     "latest_ts": None,
-                    "latest_age_ms": None,
                 }
             else:
                 out[p] = {
@@ -191,8 +190,6 @@ def build_app():
                     "window_count": snap["window_count"],
                     "recent": snap["recent"],
                     "latest_ts": snap["latest_ts"],
-                    "latest_age_ms": int((now - snap["latest_ts"]) * 1000)
-                        if snap["latest_ts"] else None,
                 }
         head = inferer.head
         live_labels = head.labels if head is not None else ["untrained"]

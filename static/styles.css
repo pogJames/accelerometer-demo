@@ -47,6 +47,7 @@
 html, body {
   margin: 0;
   padding: 0;
+  scrollbar-gutter: stable;
   background: var(--background);
   color: var(--foreground);
   font-family: 'Inter', 'Noto Sans TC', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -112,16 +113,10 @@ a { color: inherit; text-decoration: none; }
   gap: 10px;
   color: var(--foreground);
 }
+
 .brand-mark {
-  width: 28px; height: 28px;
-  border-radius: 8px;
-  background: var(--primary);
-  color: var(--primary-foreground);
-  display: grid; place-items: center;
-  font-weight: 700;
-  font-size: 13px;
+  height: 24px;
 }
-.brand-name { font-weight: 600; font-size: 14px; }
 
 /* Language toggle on far right of header */
 .lang-toggle {
@@ -201,9 +196,7 @@ a { color: inherit; text-decoration: none; }
   padding: 16px 20px;
   border-bottom: 1px solid var(--border);
 }
-.card-title { font-size: 15px; font-weight: 600; margin: 0; }
-.card-desc { color: var(--muted-foreground); font-size: 13px; margin-top: 3px; }
-.card-content { padding: 20px; }
+.card-title { font-size: 15px; font-weight: 600; margin: 0; }.card-content { padding: 20px; }
 
 /* grid for inference cards */
 .grid {
@@ -281,7 +274,6 @@ a { color: inherit; text-decoration: none; }
 .swatch.color-7 { background: var(--c7); }
 .swatch.color-8 { background: var(--c8); }
 .swatch.color-9 { background: var(--c9); }
-.age { color: var(--muted-foreground); font-size: 11px; }
 
 .empty {
   border: 1px dashed var(--border);
@@ -327,7 +319,6 @@ a { color: inherit; text-decoration: none; }
   font-size: 12px;
   color: var(--muted-foreground);
 }
-.helper.warn { color: var(--destructive); }
 
 .input, .select {
   height: 36px;
@@ -453,7 +444,7 @@ a { color: inherit; text-decoration: none; }
   letter-spacing: 0.04em;
 }
 .table tr:last-child td { border-bottom: none; }
-.table .num { font-variant-numeric: tabular-nums; text-align: right; }
+.table .num { font-variant-numeric: tabular-nums;}
 
 .toast {
   position: fixed;

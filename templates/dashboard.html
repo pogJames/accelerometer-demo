@@ -6,7 +6,7 @@
   <div>
     <h1 class="page-title">Live inference</h1>
     <div class="page-subtitle">
-      <span id="updated">never</span>.
+      Updated <span id="updated">never</span>
     </div>
   </div>
 </div>
@@ -21,7 +21,6 @@
       <div class="conf" data-conf>waiting…</div>
       <div class="strip-label">last {{ rolling_window }}</div>
       <div class="strip" data-strip></div>
-      <div class="age" data-age></div>
     </div>
   </div>
 </template>
@@ -73,13 +72,11 @@ function renderCard(port, entry) {
   const labelEl = card.querySelector("[data-label]");
   const confEl  = card.querySelector("[data-conf]");
   const stripEl = card.querySelector("[data-strip]");
-  const ageEl   = card.querySelector("[data-age]");
 
   if (!entry.majority_class_name) {
     setIfChanged(labelEl, "textContent", "—");
     setIfChanged(labelEl, "className", "label-line idle");
     setIfChanged(confEl, "textContent", "waiting for first 5 inferences…");
-    setIfChanged(ageEl, "textContent", "");
     for (const dot of stripEl.children) {
       setIfChanged(dot, "className", "dot");
     }
@@ -103,8 +100,6 @@ function renderCard(port, entry) {
     setIfChanged(dot, "className", desired);
   }
 
-  setIfChanged(ageEl, "textContent",
-    `latest reading ${entry.latest_age_ms == null ? "—" : entry.latest_age_ms + "ms"} ago`);
 }
 
 function renderEmpty(mode) {
@@ -145,7 +140,7 @@ function handleSnapshot(data) {
   if (anyChanged) {
     setIfChanged(sidebarModeEl, "textContent", data.inference_mode || "?");
     sidebarModeEl.className = "badge " + (data.inference_mode || "stub");
-    setIfChanged(updatedEl, "textContent", new Date().toLocaleTimeString());
+    setIfChanged(updatedEl, "textContent", new Date().toLocaleTimeString('en-GB'));
   }
 }
 

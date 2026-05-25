@@ -164,7 +164,7 @@ class InferenceWorker(threading.Thread):
         class_name = head.labels[class_id] if 0 <= class_id < len(head.labels) else f"class_{class_id}"
 
         self._debug_n += 1
-        if self._debug_n <= 5 or self._debug_n % 50 == 0:
+        if self._debug_n % 50 == 0:
             print(f"[inference #{self._debug_n}] window: "
                   f"min={float(window.min()):.3f} max={float(window.max()):.3f} "
                   f"std={float(window.std()):.3f} | "

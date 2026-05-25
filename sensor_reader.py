@@ -20,7 +20,6 @@ Read pattern mirrors DAQ_Modbus_MultiChs_v1.3.py; queue uses drop-oldest.
 import glob
 import os
 import queue
-import subprocess
 import sys
 import threading
 import time
@@ -170,18 +169,6 @@ def reader_process_main(port, window_queue, req_q, resp_q, stop_event, data_dir,
     data_len = result.registers[0]
     print(f"[{port}] Initial buffer length: {data_len}")
 
-    # Drain the sensor FIFO once before emitting — otherwise pre-startup
-    # backlog gets pumped through the model at 10× real-time as stale data.
-    drain_total = 0
-    drain_iters = 0
-    while data_len > 6 and drain_iters < 200:
-        count = min(data_len, MAX_PACKET)
-        result = client.read_input_registers(0x02, count=1 + count, device_id=1)
-        data_len = result.registers[0]
-        drain_total += count
-        drain_iters += 1
-    print(f"[{port}] FIFO drain: discarded {drain_total} stale samples in {drain_iters} reads (data_len now {data_len})")
-
     buffer = np.empty((0, 3), dtype=np.float32)
     last_log_t = time.time()
     emits_since_log = 0
@@ -290,10 +277,12 @@ def get_existed_serial_ports():
         candidates = glob.glob('/dev/ttyUSB*')
         # Drop USB-serial latency from 16ms to 1ms for sustained 7812 Hz throughput.
         for port in candidates:
-            cmd = ('sudo bash -c "echo 1 > /sys/bus/usb-serial/devices/ttyUSB'
-                   + port.split('USB')[-1] + '/latency_timer"')
-            print(cmd)
-            subprocess.run(cmd, shell=True, check=True, executable='/bin/bash')
+            try:
+                dev = port.split('/')[-1]
+                with open(f'/sys/bus/usb-serial/devices/{dev}/latency_timer', 'w') as f:
+                    f.write('1\n')
+            except OSError as e:
+                print(f"[{port}] latency_timer write failed: {e}")
     elif sys.platform.startswith('darwin'):
         candidates = glob.glob('/dev/tty.*')
     else:
