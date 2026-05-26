@@ -261,7 +261,7 @@ class RecordingManager:
         `ndarray.tofile` is a C-level write that releases the GIL during the
         actual bytes-to-disk handoff — that's the whole point of the binary
         format. Pure-Python CSV formatting (the previous approach) held the
-        GIL for the entire chunk and starved the reader's pymodbus poll-loop.
+        GIL for the entire chunk and starved the reader's modbus poll loop.
         """
         try:
             while True:

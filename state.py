@@ -150,3 +150,15 @@ class RollingPredictions:
     def displayable(self):
         with self._lock:
             return self._displayable
+
+    def clear(self):
+        """Drop the rolling buffer and current displayable snapshot, then
+        notify SSE clients so the UI immediately re-renders as 'waiting…'.
+        Called by app.py when switching the active sensor — stale predictions
+        from the previous activation shouldn't influence the new majority."""
+        with self._lock:
+            self._buf.clear()
+            self._displayable = None
+            self._pending = 0
+        if self._on_latch is not None:
+            self._on_latch()

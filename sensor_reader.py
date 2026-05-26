@@ -1,10 +1,10 @@
 """Worker 1 — Modbus reader, one subprocess per sensor.
 
-Runs in its OWN process (not a thread). pymodbus's busy-poll loop on the
-serial buffer is GIL-bound; sharing the GIL with Flask / InferenceWorker /
-GC pauses lets the sensor's hardware FIFO (max 65535 regs ≈ 2.8 s at
-7812 Hz) overflow and silently drop samples. A dedicated process means
-nothing in the main interpreter can stall this read loop.
+Runs in its OWN process (not a thread). The serial-buffer poll loop is
+GIL-bound; sharing the GIL with Flask / InferenceWorker / GC pauses lets
+the sensor's hardware FIFO (max 65535 regs ≈ 2.8 s at 7812 Hz) overflow
+and silently drop samples. A dedicated process means nothing in the main
+interpreter can stall this read loop.
 
 The subprocess also owns the RecordingManager — raw samples never cross
 the IPC boundary. `RecordingManager.feed()` runs locally; its writer
@@ -28,19 +28,19 @@ import numpy as np
 import serial
 
 # Up to 4 sensors. Add /dev/ttyUSB1..USB3 here as more come online.
-ALLOWED_PORTS = ['/dev/ttyUSB0', 'COM3', 'COM4']
+ALLOWED_PORTS = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2', '/dev/ttyUSB3']
 
 WINDOW_SIZE   = 2604     # 1/2 sec at 7812 Hz — must match the trained backbone
 HOP_SIZE      = 1302     # 50 % overlap → 4 emits/sec
 MAX_PACKET    = 41 * 3   # Modbus packet upper bound: 41 XYZ triplets
 TURN_GRAVITY  = 8192     # raw int16 / 8192 -> G value
 SAMPLE_RATE   = 7812
+# Precomputed float32 scale so the per-iteration decode `raw * SCALE` is one
+# numpy ufunc pass (int16 → float32 cast fused with the multiply). Was:
+# `(raw / TURN_GRAVITY).astype(np.float32)` — two passes plus a float64 temp.
+SCALE         = np.float32(1.0 / TURN_GRAVITY)
 
-# pymodbus stalls during impact-induced CRC errors / brief sensor silences.
-# Cap each failed read at this many seconds; pair with retries=0 on the
-# client so a single bad frame doesn't compound into ~12 s of pymodbus
-# internal retry (default in pymodbus 3.x).
-#
+# pyserial blocks on read() until N bytes arrive or this timeout expires.
 # 50 ms is well above the sensor's actual response time at 3 Mbaud
 # (request ~30 µs, processing a few ms, response ~700 µs — total normally
 # <10 ms) but turns a bad-packet stall into a perceptually invisible
@@ -48,7 +48,6 @@ SAMPLE_RATE   = 7812
 # If you start seeing total_fails climbing during normal (non-impact)
 # operation, bump this up — the sensor's tail latency might be longer.
 READ_TIMEOUT_S          = 0.05
-MODBUS_RETRIES          = 0
 # After this many CONSECUTIVE failed reads, drop + reopen the serial port.
 # Picks up wedged FTDI/CDC drivers and resyncs the framer.
 RECONNECT_AFTER_FAILS   = 5
@@ -75,7 +74,7 @@ def _control_listener(recorder, req_q, resp_q, stop_event):
     """Sibling thread inside the reader subprocess. Drains the request
     queue, dispatches start/cancel/status to the local RecordingManager,
     and writes a response back. Decoupled from the read loop so an RPC
-    can't stall pymodbus."""
+    can't stall the modbus poll."""
     while not stop_event.is_set():
         try:
             req = req_q.get(timeout=0.5)
@@ -98,40 +97,39 @@ def _control_listener(recorder, req_q, resp_q, stop_event):
                         "error": str(e), "error_type": type(e).__name__})
 
 
-def reader_process_main(port, window_queue, req_q, resp_q, stop_event, data_dir,
+def reader_process_main(port, window_queue, req_q, resp_q,
+                        stop_event, active_event, data_dir,
                         port_baud=3000000, bytesize=8, parity='N', stopbits=1,
                         timeout=READ_TIMEOUT_S, sample_rate=SAMPLE_RATE,
-                        window_size=WINDOW_SIZE, hop_size=HOP_SIZE, max_qsize=3):
-    """Subprocess entry point. Owns the pymodbus client + RecordingManager
+                        window_size=WINDOW_SIZE, hop_size=HOP_SIZE, max_qsize=12):
+    """Subprocess entry point. Owns the pyserial client + RecordingManager
     for one serial port.
 
+    port — e.g. '/dev/ttyUSB0'.
     window_queue — mp.Queue, push `(port, np.ndarray)` for inference.
     req_q / resp_q — mp.Queue pair, main process RPCs in / responses out.
     stop_event — mp.Event, set by main process to request shutdown.
+    active_event — mp.Event, main process sets this when this port should be
+        actively reading. When clear, the reader sleeps and burns no Modbus
+        traffic. On every inactive→active transition we re-write the
+        sample-rate register, which the sensor uses as a FIFO reset so the
+        first window after resume is fresh.
     data_dir — absolute path, where recordings get written.
     """
-    # `spawn` start method gives the child a fresh interpreter — the
-    # sys.path mutation app.py does for bundled pymodbus is NOT inherited.
-    # Re-apply it before importing pymodbus / recorder.
+    # `spawn` start method gives the child a fresh interpreter — re-apply
+    # the bundled-deps path before importing project modules.
     current_path = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_path, "site-packages"))
-    from pymodbus.client import ModbusSerialClient as ModbusClient
+    from fast_modbus import (read_input_registers, write_single_register,
+                              ModbusError)
     from recorder import RecordingManager
 
     print(f"[{port}] reader subprocess started pid={os.getpid()} ppid={os.getppid()}")
 
-    # iMX93 has 2 cores. Pin the reader to CPU 1 so Flask + InferenceWorker
-    # on the main process (CPU 0) can't preempt the modbus read loop. Without
-    # this, process separation alone still loses cycles to the kernel
-    # scheduler when main is busy serving HTTP — that's why data_len was
-    # spiking during page loads.
-    if hasattr(os, "sched_setaffinity") and (os.cpu_count() or 1) > 1:
-        try:
-            non_zero_cpus = set(range(1, os.cpu_count()))
-            os.sched_setaffinity(0, non_zero_cpus)
-            print(f"[{port}] cpu affinity set to {sorted(non_zero_cpus)}")
-        except (OSError, PermissionError) as e:
-            print(f"[{port}] sched_setaffinity failed: {e}")
+    # No CPU pinning — let the kernel schedule readers across cores
+    # however it sees fit. SCHED_FIFO below still preempts normal-priority
+    # processes when a reader has work; that's how we keep the read loop
+    # responsive without binding to a specific core.
 
     # Real-time priority so the reader preempts Flask threads whenever
     # both are runnable on the same core (fallback if affinity-pinning
@@ -151,25 +149,29 @@ def reader_process_main(port, window_queue, req_q, resp_q, stop_event, data_dir,
                      daemon=True,
                      name=f"control-{port}").start()
 
-    client = ModbusClient(port=port,
-                          baudrate=port_baud,
-                          bytesize=bytesize,
-                          parity=parity,
-                          stopbits=stopbits,
-                          timeout=timeout,
-                          retries=MODBUS_RETRIES)
-    client.connect()
+    # Direct pyserial — no pymodbus wrapper. fast_modbus does the framing.
+    client = serial.Serial(port=port,
+                            baudrate=port_baud,
+                            bytesize=bytesize,
+                            parity=parity,
+                            stopbits=stopbits,
+                            timeout=timeout)
 
-    chip = client.read_input_registers(0x80, count=3, device_id=1).registers
+    chip = read_input_registers(client, 1, 0x80, 3)
     print(f"[{port}] ChipID: {hex(chip[0])}, {hex(chip[1])}, {hex(chip[2])}")
     print(f"[{port}] SampleRate: {sample_rate}")
-    client.write_register(0x01, sample_rate, device_id=1)
+    write_single_register(client, 1, 0x01, sample_rate)
 
-    result = client.read_input_registers(0x02, count=1, device_id=1)
-    data_len = result.registers[0]
+    data_len = read_input_registers(client, 1, 0x02, 1)[0]
     print(f"[{port}] Initial buffer length: {data_len}")
 
-    buffer = np.empty((0, 3), dtype=np.float32)
+    # Pre-allocated ring buffer. Holds at most WINDOW_SIZE valid samples
+    # plus one MAX_PACKET worth of just-read tail before the next emit
+    # compacts it down. window_size * 2 gives plenty of headroom and keeps
+    # the math obvious. Per-iteration code now does a slice-assign instead
+    # of np.row_stack — no allocation in the hot path.
+    buffer = np.empty((window_size * 2, 3), dtype=np.float32)
+    fill = 0
     last_log_t = time.time()
     emits_since_log = 0
     fail_count = 0
@@ -178,28 +180,20 @@ def reader_process_main(port, window_queue, req_q, resp_q, stop_event, data_dir,
 
     def safe_read(count):
         """Returns the registers list on success, or None on any failure
-        (timeout, CRC, error response, exception). Tracks consecutive
-        failures so the outer loop can decide when to reconnect."""
+        (timeout, CRC, exception response). Tracks consecutive failures
+        so the outer loop can decide when to reconnect."""
         nonlocal fail_count, total_fails, last_fail_logged_t
         try:
-            r = client.read_input_registers(0x02, count=count, device_id=1)
-        except Exception as e:
+            r = read_input_registers(client, 1, 0x02, count)
+        except (ModbusError, serial.SerialException, OSError) as e:
             fail_count += 1
             total_fails += 1
             last_fail_logged_t = time.time()
-            print(f"[{port}] modbus read raised (#{fail_count}, total={total_fails}, "
+            print(f"[{port}] modbus read failed (#{fail_count}, total={total_fails}, "
                   f"data_len={data_len}, count={count}): {type(e).__name__}: {e}")
             return None
-        if r is None or (hasattr(r, "isError") and r.isError()) \
-                     or not getattr(r, "registers", None):
-            fail_count += 1
-            total_fails += 1
-            last_fail_logged_t = time.time()
-            print(f"[{port}] modbus error response (#{fail_count}, total={total_fails}, "
-                  f"data_len={data_len}, count={count}): {r}")
-            return None
         fail_count = 0
-        return r.registers
+        return r
 
     def reconnect():
         """Close and reopen the serial port. Cures wedged FTDI drivers and
@@ -213,14 +207,43 @@ def reader_process_main(port, window_queue, req_q, resp_q, stop_event, data_dir,
             print(f"[{port}] close raised (ignoring): {e}")
         time.sleep(0.1)
         try:
-            client.connect()
+            client.open()
             print(f"[{port}] reconnected")
         except Exception as e:
             print(f"[{port}] reconnect failed: {e} — sleeping 1s before retry")
             time.sleep(1.0)
         fail_count = 0
 
+    was_active = False
     while not stop_event.is_set():
+        if not active_event.is_set():
+            if was_active:
+                print(f"[{port}] deactivated — reader paused")
+                was_active = False
+                fill = 0
+            # Block on the event so we wake up the instant the main process
+            # activates us, instead of spinning every 50 ms.
+            active_event.wait(timeout=0.5)
+            continue
+
+        if not was_active:
+            # Just transitioned inactive → active. Re-write the sample-rate
+            # register; the sensor uses this as a FIFO reset so subsequent
+            # reads return fresh samples instead of whatever was sitting in
+            # the on-chip buffer while we were paused.
+            print(f"[{port}] activated — resetting FIFO via sample-rate write")
+            try:
+                write_single_register(client, 1, 0x01, sample_rate)
+            except (ModbusError, serial.SerialException, OSError) as e:
+                print(f"[{port}] FIFO reset failed: {e}; retry in 0.5s")
+                time.sleep(0.5)
+                continue
+            regs = safe_read(1)
+            data_len = regs[0] if regs is not None else 0
+            last_log_t = time.time()
+            emits_since_log = 0
+            was_active = True
+
         # Three-branch read (mirror DAQ_Modbus_MultiChs_v1.3.py:109-117)
         if data_len >= MAX_PACKET:
             regs = safe_read(1 + MAX_PACKET)
@@ -244,26 +267,40 @@ def reader_process_main(port, window_queue, req_q, resp_q, stop_event, data_dir,
 
         data_len = regs[0]                # updated remaining length for next iteration
 
-        raw = np.array(regs[1:], dtype=np.uint16).astype(np.int16)
-        samples = (raw / TURN_GRAVITY).reshape(-1, 3).astype(np.float32)
+        # Decode: list[int] → uint16 → int16 view (no copy, two's-complement
+        # reinterpret) → float32 array via fused cast+scale ufunc.
+        raw = np.array(regs[1:], dtype=np.uint16).view(np.int16)
+        samples = (raw * SCALE).reshape(-1, 3)
 
         # Recording tap — local to this process, no IPC. feed() is cheap
-        # when no session is active (one-line port-match check).
+        # when no session is active (one-line port-match check). Keep `samples`
+        # as a separate small array so the recorder's stage-1 chunk list can
+        # hold the reference safely while we compact the ring buffer below.
         recorder.feed(port, samples)
 
-        buffer = np.row_stack((buffer, samples))
+        # Slice-assign into the pre-allocated buffer instead of np.row_stack —
+        # no allocation, no full-buffer memcpy per iteration.
+        n = samples.shape[0]
+        buffer[fill:fill + n] = samples
+        fill += n
 
         # Sliding-window emission: emit whenever we have >= WINDOW_SIZE
         # samples, then drop the oldest HOP_SIZE and wait for HOP_SIZE new.
-        while buffer.shape[0] >= window_size:
+        while fill >= window_size:
             _emit_window(window_queue, port, buffer[:window_size].copy(), max_qsize)
-            buffer = buffer[hop_size:]
+            # Compact the tail. .copy() avoids overlapping-slice UB when
+            # fill > 2*hop_size (happens whenever a packet pushes fill past
+            # window_size by more than one MAX_PACKET).
+            new_fill = fill - hop_size
+            if new_fill > 0:
+                buffer[:new_fill] = buffer[hop_size:fill].copy()
+            fill = new_fill
             emits_since_log += 1
 
         now = time.time()
         if now - last_log_t >= 1.0:
             print(f"[{port}] emit rate: {emits_since_log}/s · data_len={data_len} "
-                  f"· buffer={buffer.shape[0]} · total_fails={total_fails}")
+                  f"· buffer={fill} · total_fails={total_fails}")
             emits_since_log = 0
             last_log_t = now
 

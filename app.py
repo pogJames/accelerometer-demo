@@ -22,11 +22,12 @@ import sys
 import threading
 import time
 
-# Bundled pymodbus lives in ./site-packages on the embedded device.
-# On Linux (fork), child processes inherit sys.path from the parent but
-# reader_process_main re-applies it anyway for safety. On Windows (spawn,
-# which is the platform default), reader_process_main MUST re-apply it
-# because spawn gives the child a fresh interpreter with no inherited state.
+# Bundled deps (if any) live in ./site-packages on the embedded device —
+# we used to ship pymodbus this way; the path insert is harmless when the
+# directory is empty and the safety net stays in case something else gets
+# bundled later. On Linux (fork), child processes inherit sys.path; on
+# Windows (spawn, the default), reader_process_main re-applies it because
+# spawn gives the child a fresh interpreter with no inherited state.
 current_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(current_path, "site-packages"))
 
@@ -115,8 +116,11 @@ def build_app():
     head_path = os.path.join(current_path, DEFAULT_HEAD_PATH)
 
     # mp.Queue crosses the process boundary; pickling cost is ~1–2 ms for
-    # a (3906, 3) float32 window — negligible vs the 250 ms hop interval.
-    window_queue = mp.Queue(maxsize=8)
+    # a (2604, 3) float32 window — negligible vs the 167 ms hop interval.
+    # Cap at 16 so 4 readers (max_qsize=12 in sensor_reader) have headroom
+    # before put() would block; drop-oldest on the writer side kicks in
+    # well before we hit the maxsize cap.
+    window_queue = mp.Queue(maxsize=16)
     bus = SnapshotBus()
     rolling_predictions = {p: RollingPredictions(on_latch=bus.bump) for p in ports}
 
@@ -124,12 +128,17 @@ def build_app():
     req_qs   = {p: mp.Queue() for p in ports}
     resp_qs  = {p: mp.Queue() for p in ports}
     stop_events = {p: mp.Event() for p in ports}
+    # active_events start CLEAR — every reader is paused on boot. The UI
+    # (or /api/record/start) flips exactly one event at a time so only one
+    # sensor is ever pulling Modbus traffic; switching ports resets the
+    # paused port's FIFO via a sample-rate rewrite inside the subprocess.
+    active_events = {p: mp.Event() for p in ports}
     reader_procs = {}
     for p in ports:
         proc = mp.Process(
             target=reader_process_main,
             args=(p, window_queue, req_qs[p], resp_qs[p],
-                  stop_events[p], data_dir),
+                  stop_events[p], active_events[p], data_dir),
             daemon=True,
             name=f"reader-{p.replace('/', '_')}",
         )
@@ -137,15 +146,8 @@ def build_app():
         reader_procs[p] = proc
         print(f"[app] spawned reader process for {p} (pid={proc.pid})")
 
-    # Confine the main process (Flask + InferenceWorker + trainer) to CPU 0
-    # AFTER spawning readers — so subprocess inheritance leaves them free to
-    # widen their own affinity to CPU 1+ without fighting cpuset constraints.
-    if hasattr(os, "sched_setaffinity") and (os.cpu_count() or 1) > 1:
-        try:
-            os.sched_setaffinity(0, {0})
-            print(f"[app] main process pinned to CPU 0 (pid={os.getpid()})")
-        except (OSError, PermissionError) as e:
-            print(f"[app] sched_setaffinity failed: {e}")
+    # No CPU pinning for the main process either — the kernel schedules
+    # Flask + InferenceWorker alongside the reader subprocesses freely.
 
     recorders = {p: RemoteRecorder(req_qs[p], resp_qs[p], p) for p in ports}
 
@@ -159,6 +161,31 @@ def build_app():
         with record_state_lock:
             p = record_state["port"]
         return recorders.get(p)
+
+    # Any subset of readers can be active at once. The active_events dict is
+    # the source of truth — no separate state tracking needed. Lock serialises
+    # set/clear pairs so concurrent /api/active_port requests don't race the
+    # rolling-buffer clear with each other.
+    active_state_lock = threading.Lock()
+
+    def activate(port):
+        """Wake the reader for `port`. No-op if already active.
+        Clears the port's rolling buffer so the dashboard immediately shows
+        'waiting…' instead of stale predictions from a previous activation."""
+        if port not in ports:
+            raise ValueError(f"unknown port: {port!r}")
+        with active_state_lock:
+            if active_events[port].is_set():
+                return
+            rolling_predictions[port].clear()
+            active_events[port].set()
+
+    def deactivate(port):
+        """Pause the reader for `port`. No-op if already inactive."""
+        if port not in ports:
+            raise ValueError(f"unknown port: {port!r}")
+        with active_state_lock:
+            active_events[port].clear()
 
     inferer = InferenceWorker(window_queue, rolling_predictions,
                               head_path=head_path)
@@ -194,11 +221,14 @@ def build_app():
         head = inferer.head
         live_labels = head.labels if head is not None else ["untrained"]
         label_colors = head.label_color_map() if head is not None else {"untrained": -1}
+        with active_state_lock:
+            active_ports = [p for p in ports if active_events[p].is_set()]
         return {
             "ports": out,
             "inference_mode": inferer.mode,
             "class_labels": live_labels,
             "label_colors": label_colors,
+            "active_ports": active_ports,
             "now": now,
         }
 
@@ -296,6 +326,12 @@ def build_app():
         if not isinstance(target_samples, int) or target_samples <= 0:
             return jsonify({"error": "target_samples must be a positive integer"}), 400
 
+        # Recording can't proceed unless the reader for this port is awake —
+        # feed() runs inside the reader subprocess, so a paused reader means
+        # zero samples committed. Activating is additive (multiple sensors
+        # can be active at once); this does not pause anything else.
+        activate(port)
+
         try:
             session = recorders[port].start(name=name, target_samples=target_samples,
                                             port=port, mode=mode)
@@ -305,6 +341,23 @@ def build_app():
         with record_state_lock:
             record_state["port"] = port
         return jsonify({"session": session})
+
+    @app.route("/api/active_port", methods=["POST"])
+    def api_set_active_port():
+        """Toggle one port's active state. Body: {port: "/dev/ttyUSB0",
+        active: true|false}. Activating one port no longer deactivates
+        others — any subset may be active simultaneously."""
+        body = request.get_json(silent=True) or {}
+        port = body.get("port")
+        active = bool(body.get("active"))
+        try:
+            if active:
+                activate(port)
+            else:
+                deactivate(port)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"port": port, "active": active})
 
     @app.route("/api/record/status")
     def record_status():

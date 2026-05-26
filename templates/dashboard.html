@@ -14,9 +14,12 @@
 <div id="cards" class="grid"></div>
 
 <template id="card-tpl">
-  <div class="card port-card">
-    <div class="card-content">
-      <div class="port"></div>
+  <div class="port-card">
+    <button class="port-card-header" type="button" data-toggle>
+      <span class="port"></span>
+      <span class="chevron" aria-hidden="true">›</span>
+    </button>
+    <div class="port-card-body">
       <div class="label-line idle" data-label>—</div>
       <div class="conf" data-conf>waiting…</div>
       <div class="strip-label">last {{ rolling_window }}</div>
@@ -62,9 +65,35 @@ function ensureCard(port) {
     dot.className = "dot";
     stripEl.appendChild(dot);
   }
+  // Header click → toggle just this port's active state. Other cards stay
+  // open if they were open. Optimistic local update will be confirmed (or
+  // corrected) by the next SSE snapshot.
+  node.querySelector("[data-toggle]").addEventListener("click", () => {
+    const willActivate = !node.classList.contains("expanded");
+    postActivePort(port, willActivate);
+    node.classList.toggle("expanded", willActivate);
+  });
   cards.appendChild(node);
   portCards.set(port, node);
   return node;
+}
+
+function postActivePort(port, active) {
+  fetch("/api/active_port", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ port, active }),
+  }).catch(err => console.warn("active_port POST failed:", err));
+}
+
+function syncExpandedTo(activePortsList) {
+  const activeSet = new Set(activePortsList || []);
+  for (const [p, node] of portCards) {
+    const want = activeSet.has(p);
+    if (node.classList.contains("expanded") !== want) {
+      node.classList.toggle("expanded", want);
+    }
+  }
 }
 
 function renderCard(port, entry) {
@@ -136,6 +165,10 @@ function handleSnapshot(data) {
     renderCard(port, entry);
     anyChanged = true;
   }
+
+  // Authoritative set of expanded cards — comes from the server so a
+  // change via /record (or a separate browser tab) is reflected here.
+  syncExpandedTo(data.active_ports);
 
   if (anyChanged) {
     setIfChanged(sidebarModeEl, "textContent", data.inference_mode || "?");
