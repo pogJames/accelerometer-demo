@@ -19,6 +19,7 @@ import numpy as np
 WINDOW_SIZE      = 2604
 SAMPLE_RATE      = 7812
 DISPLAY_POINTS   = 256
+MIN_RAW_SAMPLES  = 32       # floor for the user-set raw window (savgol needs a few)
 
 SAVGOL_WINDOW    = 11
 SAVGOL_POLYORDER = 3
@@ -90,12 +91,6 @@ FFT_BACKEND_NAME, _make_fft_plan, _run_fft_plan = _load_fft_backend()
 print(f"[waveform] FFT backend = {FFT_BACKEND_NAME}")
 
 
-def _decimate_to(arr, n_out):
-    """Strided decimation to length n_out. Input len must be >= n_out."""
-    stride = arr.shape[0] // n_out
-    return arr[:stride * n_out:stride][:n_out]
-
-
 class WaveformBus:
     """SnapshotBus-equivalent for the waveform stream. Kept separate from
     state.SnapshotBus so prediction and waveform SSE don't false-wake each
@@ -133,10 +128,20 @@ class WaveformAggregator:
         self.display_points = display_points
         self._on_publish = on_publish
 
-        # Raw view shows only the freshest hop — the last half of each
-        # 2604-sample window, which is exactly the new samples since the
-        # previous emit (the other half is the 50% overlap, already shown).
-        self.raw_samples = window_size // 2     # 1302 at the default config
+        # How many of the most recent samples raw mode shows — user-tunable
+        # (set_raw_samples). Capped at the window we receive (no ring buffer);
+        # default is half the window (the freshest hop).
+        self.raw_max_samples = window_size
+        self.raw_samples = min(window_size // 2, window_size)
+
+        # How many low-frequency FFT bins to ship — user-tunable from the UI
+        # (set_fft_max_hz). Each bin is sample_rate/window_size ≈ 3 Hz wide;
+        # the cap is the rFFT's Nyquist bin count (window_size//2). Default is
+        # the lower half of what raw covers — the demo rig has no motor fast
+        # enough to excite higher bins.
+        self.bin_hz = sample_rate / window_size
+        self.fft_max_bins = window_size // 2     # Nyquist
+        self.fft_bins = min(display_points // 2, self.fft_max_bins)
 
         self._lock = threading.Lock()
         self._latest = {p: None for p in ports}
@@ -148,18 +153,43 @@ class WaveformAggregator:
         # one-shot cost at first use, not at construction.
         self._plans = {p: _make_fft_plan(window_size) for p in ports}
 
-        # Pre-computed axes for the client (constant per session, not per
-        # snapshot — saves bandwidth). Raw spans the last hop in time;
-        # FFT covers the first display_points rFFT bins (k=1..N) of the full
-        # window, giving 3 Hz/bin up to ~768 Hz.
-        self.time_axis_ms = np.linspace(0.0,
-                                        1000.0 * self.raw_samples / sample_rate,
-                                        display_points,
-                                        dtype=np.float32).tolist()
-        self.freq_axis_hz = (
-            np.arange(1, display_points + 1, dtype=np.float32)
-            * (sample_rate / window_size)
-        ).tolist()
+        # Axes shipped to the client. raw_axis is "samples ago" ascending
+        # (0 = latest); the client renders it with a reversed x-scale so 0
+        # lands on the right. freq_axis_hz is the FFT bin centre frequencies.
+        self.raw_axis = self._make_raw_axis(self.raw_samples)
+        self.freq_axis_hz = self._make_freq_axis(self.fft_bins)
+
+    def _make_freq_axis(self, bins):
+        return (np.arange(1, bins + 1, dtype=np.float32) * self.bin_hz).tolist()
+
+    def _make_raw_axis(self, n):
+        """'Samples ago' axis, ascending 0..n-1, length min(n, display_points).
+        0 is the latest sample; the client reverses the scale so it sits on
+        the right edge while the tick labels stay nicely rounded."""
+        m = min(n, self.display_points)
+        return np.linspace(0.0, n - 1, m, dtype=np.float32).tolist()
+
+    def set_fft_max_hz(self, hz):
+        """Set the upper frequency shown in FFT mode. Converts to a bin count
+        (each bin ≈ bin_hz), clamps to [1, Nyquist], and rebuilds the freq
+        axis. Returns the actual max frequency applied (bins * bin_hz)."""
+        bins = int(round(float(hz) / self.bin_hz))
+        bins = max(1, min(bins, self.fft_max_bins))
+        axis = self._make_freq_axis(bins)
+        with self._lock:
+            self.fft_bins = bins
+            self.freq_axis_hz = axis
+        return bins * self.bin_hz
+
+    def set_raw_samples(self, n):
+        """Set how many of the most recent samples raw mode shows. Clamps to
+        [MIN_RAW_SAMPLES, window]. Returns the applied count."""
+        n = max(MIN_RAW_SAMPLES, min(int(n), self.raw_max_samples))
+        axis = self._make_raw_axis(n)
+        with self._lock:
+            self.raw_samples = n
+            self.raw_axis = axis
+        return n
 
     def publish(self, port, window):
         """Called from the waveform worker thread on every window. Both raw
@@ -196,24 +226,33 @@ class WaveformAggregator:
             self._on_publish()
 
     def _compute_raw(self, window):
-        """Decimated, smoothed view of the last `raw_samples` rows of window."""
-        tail = window[-self.raw_samples:, :]
+        """Smoothed view of the last `raw_samples` rows, ordered latest→oldest
+        so it lines up with the ascending 'samples ago' raw_axis (the client's
+        reversed x-scale then puts the latest sample on the right)."""
+        n = self.raw_samples
+        m = min(n, self.display_points)
+        tail = window[-n:, :]
+        # Output positions correspond to raw_axis = linspace(0, n-1, m), i.e.
+        # "samples ago". src maps each to a tail index (latest = n-1 first).
+        x_ago = np.linspace(0.0, n - 1, m)
+        src = np.clip((n - 1 - x_ago).round().astype(int), 0, n - 1)
         out = {}
         for axis_idx, axis_name in enumerate(("x", "y", "z")):
             axis = np.ascontiguousarray(tail[:, axis_idx], dtype=np.float32)
             smoothed = _savgol(axis)
-            out[axis_name] = _decimate_to(smoothed, self.display_points).tolist()
+            out[axis_name] = smoothed[src].astype(np.float32).tolist()
         return out
 
     def _compute_fft(self, port, window):
-        """Magnitude of the first display_points rFFT bins (DC excluded) of
-        the full 2604-sample window, per axis. Uses the cached FFTW plan."""
+        """Magnitude of the first fft_bins rFFT bins (DC excluded) of the full
+        2604-sample window, per axis. Uses the cached FFTW plan."""
         plan = self._plans[port]
+        bins = self.fft_bins        # snapshot once — may change mid-stream
         out = {}
         for axis_idx, axis_name in enumerate(("x", "y", "z")):
             axis = np.ascontiguousarray(window[:, axis_idx], dtype=np.float32)
             mag = _run_fft_plan(plan, axis)
-            out[axis_name] = mag[1:1 + self.display_points].astype(np.float32).tolist()
+            out[axis_name] = mag[1:1 + bins].astype(np.float32).tolist()
         return out
 
     def snapshot(self):
@@ -231,13 +270,22 @@ class WaveformAggregator:
                     }
                 else:
                     ports_out[port] = entry
+            # read under lock — the setters swap value+axis together
+            freq_axis = self.freq_axis_hz
+            fft_bins = self.fft_bins
+            raw_axis = self.raw_axis
+            raw_n = self.raw_samples
         return {
             "ports": ports_out,
-            "time_axis_ms": self.time_axis_ms,
-            "freq_axis_hz": self.freq_axis_hz,
+            "raw_axis": raw_axis,
+            "freq_axis_hz": freq_axis,
             "fft_backend": FFT_BACKEND_NAME,
             "sample_rate": self.sample_rate,
             "window_size": self.window_size,
-            "raw_samples": self.raw_samples,
+            "raw_samples": raw_n,
+            "raw_max_samples": self.raw_max_samples,
+            "fft_bins": fft_bins,
+            "fft_bin_hz": self.bin_hz,
+            "fft_max_bins": self.fft_max_bins,
             "now": time.time(),
         }

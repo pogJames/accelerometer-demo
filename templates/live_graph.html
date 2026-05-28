@@ -170,6 +170,17 @@
     <button type="button" data-mode="raw" aria-pressed="true">Raw</button>
     <button type="button" data-mode="fft" aria-pressed="false">FFT</button>
   </div>
+  <label id="ctl-fft" class="toolbar-meta" style="display:none; align-items:center; gap:6px;">
+    <span>FFT range</span>
+    <input id="fft-range" class="select" type="number" min="1" max="800" step="10"
+           value="400" style="width:80px; padding:6px 8px;"> Hz
+  </label>
+  <label id="ctl-raw" class="toolbar-meta" style="display:flex; align-items:center; gap:6px;">
+    <span>Latest</span>
+    <input id="raw-range" class="select" type="number" min="32" max="{{ window_size }}" step="50"
+           value="{{ raw_samples }}" style="width:90px; padding:6px 8px;">
+    <span>samples</span>
+  </label>
   <div class="toolbar-meta">
     {{ display_points }} pts/trace · {{ sample_rate }} Hz
   </div>
@@ -209,6 +220,11 @@ const AXIS_COLORS = {
 };
 const PLOT_HEIGHT = 280;
 
+// uPlot draws axis labels on <canvas>, so i18n.js's DOM walker can't reach
+// them. Translate explicitly via window.t() (the four strings live in the
+// i18n.js dictionary). Falls back to English if i18n hasn't loaded.
+const tr = (s) => (window.t ? window.t(s) : s);
+
 let mode = "raw";          // "raw" | "fft"
 const lastRawSeq = new Map();
 const lastFftSeq = new Map();
@@ -218,9 +234,10 @@ const containers = new Map();     // port -> <div data-plot>
 const statEls   = new Map();      // port -> {x, y, z} stat-value spans
 const cachedData = new Map();     // port -> {raw: [x,y1,y2,y3], fft: [...]} for instant mode swap
 const axisShow  = new Map();      // port -> {x, y, z} (true = visible)
-let timeAxis = null;
+let rawAxis = null;        // "samples ago" ascending (0 = latest)
 let freqAxis = null;
 let lastSnapshot = null;
+const WINDOW_SIZE = {{ window_size }};
 
 // ── activation ───────────────────────────────────────────────────────
 function activateAll(active) {
@@ -244,8 +261,13 @@ function getAxisShow(port) {
 function buildOpts(width, port) {
   const isFft = mode === "fft";
   const show = getAxisShow(port);
-  const xUnit = isFft ? "Hz" : "ms";
-  const yLabel = isFft ? "Magnitude" : "G";
+  const yLabel = isFft ? tr("Magnitude") : "G";   // "Magnitude" is translatable
+
+  // Tooltip x line: "440 Hz" in FFT mode, "last 523 sample" in raw mode.
+  const xLine = (v) => isFft
+    ? `${v.toFixed(0)} Hz`
+    : (window.t ? window.t("last {n} sample", { n: v.toFixed(0) })
+                : `last ${v.toFixed(0)} sample`);
 
   // setCursor fires on every mouse move. Read the data at the cursor index
   // and paint a tooltip in u.over. The tooltip element is attached in
@@ -258,7 +280,7 @@ function buildOpts(width, port) {
     const xVal = u.data[0][idx];
     const fmtY = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(3);
     tt.innerHTML =
-      `<div class="tt-x">${isFft ? xVal.toFixed(0) : xVal.toFixed(1)} ${xUnit}</div>` +
+      `<div class="tt-x">${xLine(xVal)}</div>` +
       `<div class="tt-row row-x"><span class="tt-name">X</span><span>${fmtY(u.data[1][idx])} ${yLabel}</span></div>` +
       `<div class="tt-row row-y"><span class="tt-name">Y</span><span>${fmtY(u.data[2][idx])} ${yLabel}</span></div>` +
       `<div class="tt-row row-z"><span class="tt-name">Z</span><span>${fmtY(u.data[3][idx])} ${yLabel}</span></div>`;
@@ -279,12 +301,14 @@ function buildOpts(width, port) {
     legend: { show: false },
     hooks: { setCursor: [updateTooltip] },
     scales: {
-      x: { time: false },
+      // Raw x is "samples ago" (0 = latest). Reverse the scale so 0 lands on
+      // the right while the tick labels stay nicely rounded (N … 0).
+      x: { time: false, dir: isFft ? 1 : -1 },
       y: { auto: true },
     },
     axes: [
       {
-        label: isFft ? "Frequency (Hz)" : "Time (ms)",
+        label: isFft ? tr("Frequency (Hz)") : tr("Latest Samples"),
         labelSize: 22,
         labelGap: 4,
         size: 36,
@@ -293,7 +317,7 @@ function buildOpts(width, port) {
         ticks: { stroke: "hsl(240 5.9% 90%)" },
       },
       {
-        label: isFft ? "Magnitude" : "Acceleration (G)",
+        label: isFft ? tr("Magnitude") : tr("Acceleration (G)"),
         labelSize: 22,
         labelGap: 4,
         size: 50,
@@ -348,6 +372,13 @@ function makePlot(port) {
 function destroyAllPlots() {
   for (const u of uPlots.values()) u.destroy();
   uPlots.clear();
+}
+
+function rebuildPlots() {
+  // Recreate every plot — used on mode toggle and language switch, since
+  // axis labels are baked into uPlot at construction (canvas, not DOM).
+  destroyAllPlots();
+  for (const port of PORTS) { makePlot(port); refreshChipDimming(port); }
 }
 
 function initPlots() {
@@ -447,11 +478,13 @@ function updateStats(port, entry) {
     if (!cell) continue;
     let text = "—";
     if (isFft && entry.fft && entry.fft[ax]) {
-      const peak = computePeak(entry.fft[ax], freqAxis);
-      if (peak) text = `${peak[0].toFixed(3)} @ ${peak[1].toFixed(0)} Hz`;
+      // Guard the transient bin-count change (see renderPort).
+      const peak = (freqAxis && entry.fft[ax].length === freqAxis.length)
+        ? computePeak(entry.fft[ax], freqAxis) : null;
+      if (peak) text = `${peak[1].toFixed(0)} Hz`;   // peak frequency only
     } else if (!isFft && entry.raw && entry.raw[ax]) {
       const mm = computeRawStat(entry.raw[ax]);
-      if (mm) text = `${fmtSigned(mm[0])} … ${fmtSigned(mm[1])} G`;
+      if (mm) text = `${fmtSigned(mm[0])} ${tr("to")} ${fmtSigned(mm[1])} G`;
     }
     setIfChanged(cell, "textContent", text);
   }
@@ -461,8 +494,13 @@ function updateStats(port, entry) {
 function renderPort(port, entry) {
   const isFft = mode === "fft";
   const data = isFft ? entry.fft : entry.raw;
-  const axis = isFft ? freqAxis : timeAxis;
+  const axis = isFft ? freqAxis : rawAxis;
   if (!data || !axis) return;
+
+  // The FFT bin count is user-tunable; for one frame after a change the
+  // cached fft (old length) can pair with a new-length freq axis. Skip until
+  // they match again (next publish recomputes consistently).
+  if (axis.length !== data.x.length) return;
 
   const arr = [axis, data.x, data.y, data.z];
 
@@ -484,18 +522,25 @@ function renderPort(port, entry) {
   }
 }
 
+function syncRangeControls() {
+  const fftCtl = document.getElementById("ctl-fft");
+  const rawCtl = document.getElementById("ctl-raw");
+  if (fftCtl) fftCtl.style.display = (mode === "fft") ? "flex" : "none";
+  if (rawCtl) rawCtl.style.display = (mode === "raw") ? "flex" : "none";
+}
+
 function setMode(next) {
   if (next === mode) return;
   mode = next;
   for (const btn of document.querySelectorAll(".mode-toggle button")) {
     btn.setAttribute("aria-pressed", btn.dataset.mode === mode ? "true" : "false");
   }
+  syncRangeControls();
   // Destroy + recreate so axis labels update. Cheap (~5 ms × 4 charts) and
   // only happens on user click. makePlot picks up the cached data per port
   // so the swap shows real data instantly. axisShow is carried into the
   // rebuilt opts via getAxisShow(port).
-  destroyAllPlots();
-  for (const port of PORTS) { makePlot(port); refreshChipDimming(port); }
+  rebuildPlots();
 
   // Stats row also needs to switch from min/max <-> peak. Re-read from the
   // last snapshot we received — the data hasn't changed, only the format.
@@ -509,7 +554,7 @@ function setMode(next) {
 
 function handleSnapshot(data) {
   lastSnapshot = data;
-  if (data.time_axis_ms) timeAxis = data.time_axis_ms;
+  if (data.raw_axis) rawAxis = data.raw_axis;
   if (data.freq_axis_hz) freqAxis = data.freq_axis_hz;
 
   let anyChanged = false;
@@ -527,7 +572,7 @@ function handleSnapshot(data) {
     // visible mode.
     if (entry.raw) {
       const cache = cachedData.get(port) || {};
-      cache.raw = [timeAxis, entry.raw.x, entry.raw.y, entry.raw.z];
+      cache.raw = [rawAxis, entry.raw.x, entry.raw.y, entry.raw.z];
       cachedData.set(port, cache);
     }
     if (entry.fft) {
@@ -555,6 +600,69 @@ function handleSnapshot(data) {
 // document order).
 for (const btn of document.querySelectorAll(".mode-toggle button")) {
   btn.addEventListener("click", () => setMode(btn.dataset.mode));
+}
+
+// Range pickers. FFT mode: upper frequency in Hz (capped at 800). Raw mode:
+// how many latest samples to show. Both POST to the server; the new axis
+// arrives in the next snapshot. Persisted in localStorage.
+const PREFS_KEY = "waveformPrefs";
+const loadPrefs = () => { try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; } };
+const savePrefs = (p) => { try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch {} };
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+function postConfig(body) {
+  fetch("/api/waveform_config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch(() => {});
+}
+
+const fftRangeEl = document.getElementById("fft-range");
+const rawRangeEl = document.getElementById("raw-range");
+
+function applyFftRange(hz, persist) {
+  hz = clamp(Math.round(Number(hz) || 0), 1, 800);   // hard cap 800 Hz
+  if (fftRangeEl) fftRangeEl.value = String(hz);
+  postConfig({ fft_max_hz: hz });
+  if (persist) { const p = loadPrefs(); p.fftMaxHz = hz; savePrefs(p); }
+}
+
+function applyRawSamples(n, persist) {
+  n = clamp(Math.round(Number(n) || 0), 32, WINDOW_SIZE);
+  if (rawRangeEl) rawRangeEl.value = String(n);
+  postConfig({ raw_samples: n });
+  if (persist) { const p = loadPrefs(); p.rawSamples = n; savePrefs(p); }
+}
+
+if (fftRangeEl) fftRangeEl.addEventListener("change", () => applyFftRange(fftRangeEl.value, true));
+if (rawRangeEl) rawRangeEl.addEventListener("change", () => applyRawSamples(rawRangeEl.value, true));
+
+// Restore persisted choices and push them to the server on load.
+{
+  const p = loadPrefs();
+  if (p.fftMaxHz != null) applyFftRange(p.fftMaxHz, false);
+  if (p.rawSamples != null) applyRawSamples(p.rawSamples, false);
+}
+
+// Language toggle re-applies DOM translations via i18n.js, but the uPlot
+// canvas labels are baked in at construction — wrap setLang so a language
+// switch also rebuilds the plots with the freshly-translated axis labels.
+if (window.setLang && !window.setLang.__wfWrapped) {
+  const origSetLang = window.setLang;
+  window.setLang = function (lang) {
+    origSetLang(lang);
+    rebuildPlots();
+    // Refresh the stat chips too — "to"/"到" changes — straight from the last
+    // snapshot so paused sensors (no incoming SSE tick) still update.
+    if (lastSnapshot) {
+      for (const port of PORTS) {
+        const entry = (lastSnapshot.ports || {})[port];
+        if (entry) updateStats(port, entry);
+      }
+    }
+  };
+  window.setLang.__wfWrapped = true;
 }
 
 initPlots();

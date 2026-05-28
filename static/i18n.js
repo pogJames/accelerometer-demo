@@ -29,6 +29,12 @@
     'Frequency (Hz)': '頻率 (Hz)',
     'Acceleration (G)': '加速度 (G)',
     'Magnitude': '幅值',
+    'to': '到',
+    'FFT range': 'FFT 範圍',
+    'Latest Samples': '最近樣本數',
+    'Latest': '最近',
+    'samples': '樣本',
+    'last {n} sample': '倒數第 {n} 個樣本',
     'no sensors connected': '無感測器連接',
     'FFT backend': 'FFT 後端',
 

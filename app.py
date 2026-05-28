@@ -348,7 +348,9 @@ def build_app():
         return render_template("live_graph.html",
                                active_page="graphs",
                                sample_rate=SAMPLE_RATE,
-                               display_points=waveform_agg.display_points)
+                               display_points=waveform_agg.display_points,
+                               window_size=waveform_agg.window_size,
+                               raw_samples=waveform_agg.raw_samples)
 
     @app.route("/inference")
     def inference_dashboard():
@@ -358,6 +360,22 @@ def build_app():
                                active_page="live",
                                class_labels=labels,
                                rolling_window=ROLLING_WINDOW)
+
+    @app.route("/api/waveform_config", methods=["POST"])
+    def waveform_config():
+        body = request.get_json(silent=True) or {}
+        out = {}
+        try:
+            if body.get("fft_max_hz") is not None:
+                out["fft_max_hz"] = waveform_agg.set_fft_max_hz(body["fft_max_hz"])
+                out["fft_bins"] = waveform_agg.fft_bins
+            if body.get("raw_samples") is not None:
+                out["raw_samples"] = waveform_agg.set_raw_samples(body["raw_samples"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "config values must be numbers"}), 400
+        if not out:
+            return jsonify({"error": "expected fft_max_hz or raw_samples"}), 400
+        return jsonify(out)
 
     @app.route("/settings")
     def settings_page():
