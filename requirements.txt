@@ -11,6 +11,7 @@ pandas==3.0.2
 protobuf==7.34.1
 py-spy==0.4.2
 pybind11==3.0.4
+pyfftw
 pyserial==3.5
 python-dateutil==2.9.0.post0
 typing_extensions==4.15.0

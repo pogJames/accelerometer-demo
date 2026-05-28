@@ -9,6 +9,7 @@ fallback — _classify() handles both via dtype-aware quant/dequant.
 """
 
 import os
+import queue
 import threading
 import time
 import numpy as np
@@ -31,13 +32,28 @@ class InferenceWorker(threading.Thread):
     def __init__(self, window_queue, rolling_predictions,
                  model_path=None,
                  delegate_path=DEFAULT_DELEGATE_PATH,
-                 head_path=DEFAULT_HEAD_PATH):
+                 head_path=DEFAULT_HEAD_PATH,
+                 waveform_aggregator=None):
         super().__init__(daemon=True)
         self.window_queue = window_queue
         self.rolling_predictions = rolling_predictions
         self.model_path = model_path or _resolve_default_model_path()
         self.delegate_path = delegate_path
         self.head_path = head_path
+        self._waveform = waveform_aggregator
+
+        # In-process fan-out queues. The drainer (run()) keeps the upstream
+        # cross-process mp.Queue empty by doing only get + put_nowait — no
+        # GIL-heavy work. Downstream workers consume from their own queues
+        # at their own pace; drop-oldest on Full means a slow downstream
+        # never back-pressures the drainer. maxsize=8 ≈ 1.3 s of windows at
+        # 6 Hz × 4 ports.
+        self._classify_q = queue.Queue(maxsize=8)
+        self._waveform_q = (queue.Queue(maxsize=8)
+                            if waveform_aggregator is not None else None)
+        self._classify_thread = None
+        self._waveform_thread = None
+
         self._stopper = threading.Event()
         self.mode = "stub"      # "npu" | "cpu" | "stub"
         self._interp = None
@@ -174,7 +190,65 @@ class InferenceWorker(threading.Thread):
 
         return class_id, sim, class_name
 
+    def _put_drop_oldest(self, q, item):
+        """Non-blocking put with drop-oldest on Full. Used by the drainer to
+        fan out into downstream in-process queues without ever back-pressuring
+        the cross-process mp.Queue."""
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _classify_loop(self):
+        """Downstream classify worker. Reads from _classify_q at whatever
+        rate _classify can sustain; if it falls behind, drop-oldest at the
+        drainer keeps the freshest window in flight — the rolling-7 majority
+        vote tolerates the missed windows."""
+        while not self.stopped():
+            try:
+                port, window = self._classify_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                class_id, confidence, class_name = self._classify(window)
+            except Exception as e:
+                print(f"[inference] invoke failed for {port}: {e}")
+                continue
+            rolling = self.rolling_predictions.get(port)
+            if rolling is None:
+                continue
+            rolling.push({
+                "class_id": class_id,
+                "class_name": class_name,
+                "confidence": confidence,
+                "ts": time.time(),
+            })
+
+    def _waveform_loop(self):
+        """Downstream waveform worker. Reads from _waveform_q and runs the
+        aggregator's savgol/FFT compute. numpy + pyfftw release the GIL, so
+        this runs concurrently with the classify thread and the drainer."""
+        while not self.stopped():
+            try:
+                port, window = self._waveform_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._waveform.publish(port, window)
+            except Exception as e:
+                print(f"[inference] waveform publish failed for {port}: {e}")
+
     def run(self):
+        """DRAINER. Does only `get + 2× put_nowait` so it can't be GIL-starved
+        by sibling threads doing heavy compute or JSON encoding. The cross-
+        process mp.Queue stays drained regardless of downstream worker speed."""
         self._try_load_interpreter()
         self.head = ClassifierHead.load(self.head_path)
         if self.head is None:
@@ -183,24 +257,25 @@ class InferenceWorker(threading.Thread):
             print(f"[inference] loaded head with {len(self.head.labels)} labels: "
                   f"{self.head.labels}")
 
+        # Spawn downstream workers AFTER interpreter load so the classify
+        # thread doesn't race the _interp=None startup window.
+        self._classify_thread = threading.Thread(
+            target=self._classify_loop, daemon=True, name="classify-worker")
+        self._classify_thread.start()
+        if self._waveform is not None:
+            self._waveform_thread = threading.Thread(
+                target=self._waveform_loop, daemon=True, name="waveform-worker")
+            self._waveform_thread.start()
+        print(f"[inference] drainer + classify"
+              f"{' + waveform' if self._waveform is not None else ''} threads up")
+
         while not self.stopped():
             try:
                 port, window = self.window_queue.get(timeout=0.5)
             except Exception:
                 continue
-            try:
-                class_id, confidence, class_name = self._classify(window)
-            except Exception as e:
-                print(f"[inference] invoke failed for {port}: {e}")
-                continue
-
-            rolling = self.rolling_predictions.get(port)
-            if rolling is None:
-                continue
-
-            rolling.push({
-                "class_id": class_id,
-                "class_name": class_name,
-                "confidence": confidence,
-                "ts": time.time(),
-            })
+            # Fan out to whoever's downstream. Drop-oldest on each in-process
+            # queue absorbs transient bursts without back-pressuring here.
+            self._put_drop_oldest(self._classify_q, (port, window))
+            if self._waveform_q is not None:
+                self._put_drop_oldest(self._waveform_q, (port, window))

@@ -40,10 +40,63 @@ from inference import InferenceWorker
 from recorder import list_existing_labels, MIN_SAMPLES, DATA_DIR
 from trainer import TrainerManager, MIN_WINDOWS, WINDOW_SIZE
 from classifier import DEFAULT_HEAD_PATH
+from waveform import WaveformAggregator, WaveformBus
 
 
 SSE_HEARTBEAT_S = 15
 RPC_TIMEOUT_S = 5.0
+ALIASES_FILENAME = "port_aliases.json"
+
+
+class PortAliases:
+    """Tiny thread-safe JSON-backed store mapping port path → friendly name.
+
+    Loaded at boot; mutated in memory by set/clear; written back to disk on
+    every change. Read access via .get(port) returns the alias if set,
+    otherwise the port string itself — keeps templates simple."""
+
+    def __init__(self, path):
+        self._path = path
+        self._lock = threading.Lock()
+        self._map = self._load()
+
+    def _load(self):
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items() if v}
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[aliases] failed to load {self._path}: {e}; starting empty")
+        return {}
+
+    def _save_locked(self):
+        try:
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._map, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._path)
+        except OSError as e:
+            print(f"[aliases] failed to save {self._path}: {e}")
+
+    def get(self, port, default=None):
+        with self._lock:
+            return self._map.get(port, default if default is not None else port)
+
+    def set(self, port, alias):
+        alias = (alias or "").strip()
+        with self._lock:
+            if alias:
+                self._map[port] = alias
+            else:
+                self._map.pop(port, None)
+            self._save_locked()
+
+    def as_dict(self):
+        with self._lock:
+            return dict(self._map)
 
 
 class RemoteRecorder:
@@ -114,6 +167,7 @@ def build_app():
     print(f"[app] data dir: {data_dir}")
 
     head_path = os.path.join(current_path, DEFAULT_HEAD_PATH)
+    aliases = PortAliases(os.path.join(current_path, ALIASES_FILENAME))
 
     # mp.Queue crosses the process boundary; pickling cost is ~1–2 ms for
     # a (2604, 3) float32 window — negligible vs the 167 ms hop interval.
@@ -122,7 +176,9 @@ def build_app():
     # well before we hit the maxsize cap.
     window_queue = mp.Queue(maxsize=16)
     bus = SnapshotBus()
+    waveform_bus = WaveformBus()
     rolling_predictions = {p: RollingPredictions(on_latch=bus.bump) for p in ports}
+    waveform_agg = WaveformAggregator(ports, on_publish=waveform_bus.bump)
 
     # Per-port reader subprocess + RPC channel for the recorder it owns.
     req_qs   = {p: mp.Queue() for p in ports}
@@ -162,33 +218,72 @@ def build_app():
             p = record_state["port"]
         return recorders.get(p)
 
-    # Any subset of readers can be active at once. The active_events dict is
-    # the source of truth — no separate state tracking needed. Lock serialises
-    # set/clear pairs so concurrent /api/active_port requests don't race the
-    # rolling-buffer clear with each other.
+    # The reader for a port must run if EITHER the user opened it for live
+    # inference OR a recording is in progress on it. We track those two
+    # reasons separately so that recording on a port the user never opened
+    # for inference doesn't leave it showing as "open" on the dashboard once
+    # the recording ends. `active_events[port]` (the reader gate) is derived
+    # from the union of the two sets. Lock serialises set/clear pairs.
     active_state_lock = threading.Lock()
+    inference_open = set()      # ports the user opened for live inference
+    recording_ports = set()     # ports held awake purely for an active recording
 
-    def activate(port):
-        """Wake the reader for `port`. No-op if already active.
-        Clears the port's rolling buffer so the dashboard immediately shows
-        'waiting…' instead of stale predictions from a previous activation."""
-        if port not in ports:
-            raise ValueError(f"unknown port: {port!r}")
-        with active_state_lock:
-            if active_events[port].is_set():
-                return
-            rolling_predictions[port].clear()
+    def _sync_reader_locked(port):
+        """Reconcile the reader gate from the two reasons it might run.
+        Caller must hold active_state_lock."""
+        if port in inference_open or port in recording_ports:
             active_events[port].set()
-
-    def deactivate(port):
-        """Pause the reader for `port`. No-op if already inactive."""
-        if port not in ports:
-            raise ValueError(f"unknown port: {port!r}")
-        with active_state_lock:
+        else:
             active_events[port].clear()
 
+    def open_inference(port):
+        """User opened this port for live inference. Clears the rolling buffer
+        so the dashboard shows 'waiting…' rather than stale predictions."""
+        if port not in ports:
+            raise ValueError(f"unknown port: {port!r}")
+        with active_state_lock:
+            if port in inference_open:
+                return
+            rolling_predictions[port].clear()
+            inference_open.add(port)
+            _sync_reader_locked(port)
+
+    def close_inference(port):
+        """User closed this port for live inference. The reader keeps running
+        if a recording is still in progress on it."""
+        if port not in ports:
+            raise ValueError(f"unknown port: {port!r}")
+        with active_state_lock:
+            inference_open.discard(port)
+            _sync_reader_locked(port)
+
+    def begin_recording(port):
+        """Hold the reader awake for a recording without marking the port as
+        open for inference."""
+        with active_state_lock:
+            recording_ports.add(port)
+            _sync_reader_locked(port)
+
+    def end_recording(port):
+        """Release the recording hold. The reader sleeps unless the user has
+        the port open for inference."""
+        with active_state_lock:
+            recording_ports.discard(port)
+            _sync_reader_locked(port)
+
+    def release_if_finished(session):
+        """Recording auto-stops in the subprocess when the target is reached;
+        the main process only learns via a status poll. Whenever we see a
+        session that's no longer 'active', release its reader hold so a port
+        opened solely for recording falls back to closed."""
+        if session and session.get("status") != "active":
+            port = session.get("port")
+            if port in recording_ports:
+                end_recording(port)
+
     inferer = InferenceWorker(window_queue, rolling_predictions,
-                              head_path=head_path)
+                              head_path=head_path,
+                              waveform_aggregator=waveform_agg)
     inferer.start()
 
     trainer = TrainerManager(data_dir=data_dir, head_path=head_path)
@@ -221,8 +316,10 @@ def build_app():
         head = inferer.head
         live_labels = head.labels if head is not None else ["untrained"]
         label_colors = head.label_color_map() if head is not None else {"untrained": -1}
+        # Report only ports the user opened for inference — a port whose
+        # reader is awake purely for recording must not show as open here.
         with active_state_lock:
-            active_ports = [p for p in ports if active_events[p].is_set()]
+            active_ports = [p for p in ports if p in inference_open]
         return {
             "ports": out,
             "inference_mode": inferer.mode,
@@ -236,22 +333,47 @@ def build_app():
                 static_folder="static",
                 template_folder="templates")
 
-    # Make inference_mode + ports available to every template (sidebar uses them).
+    # Make inference_mode + ports + aliases available to every template
+    # (sidebar uses them; per-port displays read aliases).
     @app.context_processor
     def inject_globals():
         return {
             "inference_mode": inferer.mode,
             "ports": ports,
+            "aliases": aliases.as_dict(),
         }
 
     @app.route("/")
     def index():
+        return render_template("live_graph.html",
+                               active_page="graphs",
+                               sample_rate=SAMPLE_RATE,
+                               display_points=waveform_agg.display_points)
+
+    @app.route("/inference")
+    def inference_dashboard():
         head = inferer.head
         labels = head.labels if head is not None else ["untrained"]
         return render_template("dashboard.html",
                                active_page="live",
                                class_labels=labels,
                                rolling_window=ROLLING_WINDOW)
+
+    @app.route("/settings")
+    def settings_page():
+        return render_template("settings.html", active_page="settings")
+
+    @app.route("/api/port_alias", methods=["POST"])
+    def api_set_port_alias():
+        body = request.get_json(silent=True) or {}
+        port = body.get("port")
+        alias = body.get("alias", "")
+        if port not in ports:
+            return jsonify({"error": f"unknown port: {port!r}"}), 400
+        if not isinstance(alias, str):
+            return jsonify({"error": "alias must be a string"}), 400
+        aliases.set(port, alias)
+        return jsonify({"port": port, "alias": aliases.get(port)})
 
     @app.route("/record")
     def record_page():
@@ -295,6 +417,27 @@ def build_app():
             "X-Accel-Buffering": "no",
         })
 
+    @app.route("/api/waveform_stream")
+    def waveform_stream():
+        """SSE pushing per-port live waveform snapshots at ~3 Hz/port. The
+        aggregator throttles publishing inside the inference loop; we just
+        wake on every bump and serialise the latest cached state."""
+        def gen():
+            last_seq = waveform_bus.current_seq()
+            yield f"data: {json.dumps(waveform_agg.snapshot())}\n\n"
+            while True:
+                new_seq = waveform_bus.wait_for_change(last_seq, timeout=SSE_HEARTBEAT_S)
+                if new_seq > last_seq:
+                    last_seq = new_seq
+                    yield f"data: {json.dumps(waveform_agg.snapshot())}\n\n"
+                else:
+                    yield ": heartbeat\n\n"
+
+        return Response(gen(), mimetype="text/event-stream", headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
+
     @app.route("/api/recordings")
     def recordings():
         labels = list_existing_labels(data_dir)
@@ -328,9 +471,10 @@ def build_app():
 
         # Recording can't proceed unless the reader for this port is awake —
         # feed() runs inside the reader subprocess, so a paused reader means
-        # zero samples committed. Activating is additive (multiple sensors
-        # can be active at once); this does not pause anything else.
-        activate(port)
+        # zero samples committed. begin_recording wakes the reader WITHOUT
+        # marking the port as open for inference, so a port the user never
+        # opened returns to closed once the recording finishes.
+        begin_recording(port)
 
         try:
             session = recorders[port].start(name=name, target_samples=target_samples,
@@ -352,9 +496,9 @@ def build_app():
         active = bool(body.get("active"))
         try:
             if active:
-                activate(port)
+                open_inference(port)
             else:
-                deactivate(port)
+                close_inference(port)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         return jsonify({"port": port, "active": active})
@@ -368,6 +512,7 @@ def build_app():
             session = rec.status()
         except RuntimeError as e:
             return jsonify({"error": str(e)}), 500
+        release_if_finished(session)
         return jsonify({"session": session})
 
     @app.route("/api/record/stream")
@@ -384,6 +529,7 @@ def build_app():
                         session = rec.status()
                     except RuntimeError:
                         session = None
+                release_if_finished(session)
                 yield f"data: {json.dumps({'session': session})}\n\n"
                 time.sleep(1.0)
 
@@ -401,6 +547,10 @@ def build_app():
             session = rec.cancel()
         except RuntimeError as e:
             return jsonify({"error": str(e)}), 500
+        with record_state_lock:
+            rec_port = record_state["port"]
+        if rec_port is not None:
+            end_recording(rec_port)
         return jsonify({"session": session})
 
     @app.route("/api/train/status")
@@ -436,4 +586,4 @@ def build_app():
 
 if __name__ == "__main__":
     app = build_app()
-    app.run(host="0.0.0.0", port=8000, threaded=True, debug=False)
+    app.run(host="0.0.0.0", port=80, threaded=True, debug=False)

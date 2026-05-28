@@ -55,10 +55,14 @@ function classFor(name) {
   return "color-" + slot;
 }
 
+const ALIASES = {{ aliases|tojson }};
+
 function ensureCard(port) {
   if (portCards.has(port)) return portCards.get(port);
   const node = tpl.content.firstElementChild.cloneNode(true);
-  node.querySelector(".port").textContent = port;
+  const portEl = node.querySelector(".port");
+  portEl.textContent = ALIASES[port] || port;
+  portEl.title = port;     // raw path on hover
   const stripEl = node.querySelector("[data-strip]");
   for (let i = 0; i < {{ rolling_window }}; i++) {
     const dot = document.createElement("div");

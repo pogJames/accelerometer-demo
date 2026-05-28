@@ -103,6 +103,8 @@ import { setIfChanged, fmtNumber, fmtBytes, fmtRelative, showToast } from "{{ ur
 
 const SAMPLE_RATE = {{ sample_rate }};
 const MIN_SAMPLES = {{ min_samples }};
+const ALIASES     = {{ aliases|tojson }};
+const portLabel   = (p) => ALIASES[p] || p;
 
 // --- Element refs ---
 const nameEl       = document.getElementById("rec-name");
@@ -197,7 +199,8 @@ async function refreshRecordings() {
     for (const p of availablePorts) {
       const opt = document.createElement("option");
       opt.value = p;
-      opt.textContent = p;
+      opt.textContent = portLabel(p);
+      opt.title = p;
       portEl.appendChild(opt);
     }
     if (prev && availablePorts.includes(prev)) portEl.value = prev;
@@ -242,7 +245,7 @@ function renderProgress(s) {
   progressElapsed.textContent = `${Math.floor(s.elapsed_s || 0)} s`;
   progressSamples.textContent = `${fmtNumber(s.samples_written)} / ${fmtNumber(s.target_samples)}`;
   progressPercent.textContent = `${pct}%`;
-  progressPort.textContent = s.port || "—";
+  progressPort.textContent = s.port ? portLabel(s.port) : "—";
 }
 
 // Server-pushed status updates at strict 1 Hz over SSE. Replaces the previous

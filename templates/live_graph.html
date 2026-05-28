@@ -1,0 +1,579 @@
+{% extends "_layout.html" %}
+{% block title %}Live waveform · npu-classifier{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js" defer></script>
+<style>
+  .waveform-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .mode-toggle {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    background: var(--card);
+  }
+  .mode-toggle button {
+    border: 0;
+    background: transparent;
+    color: var(--foreground);
+    padding: 8px 16px;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+    min-width: 64px;
+  }
+  .mode-toggle button[aria-pressed="true"] {
+    background: var(--primary);
+    color: var(--primary-foreground);
+  }
+  .mode-toggle button + button { border-left: 1px solid var(--border); }
+  .mode-toggle button[aria-pressed="true"] + button,
+  .mode-toggle button:has(+ button[aria-pressed="true"]) { border-color: var(--primary); }
+
+  .toolbar-meta {
+    color: var(--muted-foreground);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .waveform-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-auto-rows: minmax(0, 1fr);
+    gap: 16px;
+  }
+  @media (max-width: 1100px) {
+    .waveform-grid { grid-template-columns: 1fr; }
+  }
+  .waveform-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 1px 2px hsl(240 5% 10% / 0.04);
+    padding: 12px 12px 4px;
+  }
+  .waveform-card header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 0 6px 8px;
+  }
+  .waveform-card .port {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .waveform-card .status {
+    font-size: 11px;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+  .waveform-stats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    padding: 0 6px 8px;
+  }
+  .waveform-stats .chip {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    border-left: 3px solid transparent;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .waveform-stats .chip .axis {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--foreground);
+  }
+  .waveform-stats .chip .val {
+    color: var(--muted-foreground);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .waveform-stats .chip.axis-x { border-left-color: hsl(0 72% 51%); }
+  .waveform-stats .chip.axis-y { border-left-color: hsl(142 71% 45%); }
+  .waveform-stats .chip.axis-z { border-left-color: hsl(217 91% 60%); }
+  .waveform-stats .chip {
+    cursor: pointer;
+    user-select: none;
+    transition: opacity 0.15s ease;
+  }
+  .waveform-stats .chip.hidden { opacity: 0.35; }
+
+  /* Hover tooltip — positioned inside uPlot's overlay layer. */
+  .uplot-tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    box-shadow: 0 2px 8px hsl(240 5% 10% / 0.12);
+    z-index: 5;
+    white-space: nowrap;
+    transform: translate(8px, 8px);
+  }
+  .uplot-tooltip .tt-x {
+    color: var(--muted-foreground);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 3px;
+  }
+  .uplot-tooltip .tt-row { display: flex; gap: 8px; line-height: 1.5; }
+  .uplot-tooltip .tt-row .tt-name { font-weight: 700; }
+  .uplot-tooltip .tt-row.row-x .tt-name { color: hsl(0 72% 51%); }
+  .uplot-tooltip .tt-row.row-y .tt-name { color: hsl(142 71% 45%); }
+  .uplot-tooltip .tt-row.row-z .tt-name { color: hsl(217 91% 60%); }
+
+  .waveform-plot {
+    width: 100%;
+    height: 280px;
+  }
+  /* uPlot tweaks — match the existing design tokens */
+  .uplot, .u-wrap { font-family: 'Inter', sans-serif; }
+  .u-axis { color: hsl(240 3.8% 46.1%); }
+  .u-legend { display: none; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Live waveform</h1>
+    <div class="page-subtitle">
+      Updated <span id="updated">never</span>
+    </div>
+  </div>
+</div>
+
+<div class="waveform-toolbar">
+  <div class="mode-toggle" role="group" aria-label="Display mode">
+    <button type="button" data-mode="raw" aria-pressed="true">Raw</button>
+    <button type="button" data-mode="fft" aria-pressed="false">FFT</button>
+  </div>
+  <div class="toolbar-meta">
+    {{ display_points }} pts/trace · {{ sample_rate }} Hz
+  </div>
+</div>
+
+<div id="waveform-grid" class="waveform-grid">
+  {% for p in ports %}
+  <div class="waveform-card" data-port="{{ p }}">
+    <header>
+      <span class="port" title="{{ p }}">{{ aliases.get(p, p) }}</span>
+      <span class="status" data-status>waiting…</span>
+    </header>
+    <div class="waveform-stats" data-stats>
+      <div class="chip axis-x"><span class="axis">X</span><span class="val" data-stat="x">—</span></div>
+      <div class="chip axis-y"><span class="axis">Y</span><span class="val" data-stat="y">—</span></div>
+      <div class="chip axis-z"><span class="axis">Z</span><span class="val" data-stat="z">—</span></div>
+    </div>
+    <div class="waveform-plot" data-plot></div>
+  </div>
+  {% else %}
+  <div class="empty">No sensors connected (check <code>ALLOWED_PORTS</code> in <code>sensor_reader.py</code>).</div>
+  {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="module">
+import { setIfChanged } from "{{ url_for('static', filename='app.js') }}";
+
+// Ports come from the server template. The SSE payload tags each port; we
+// match by port string.
+const PORTS = {{ ports|tojson }};
+const AXIS_COLORS = {
+  x: "hsl(0 72% 51%)",
+  y: "hsl(142 71% 45%)",
+  z: "hsl(217 91% 60%)",
+};
+const PLOT_HEIGHT = 280;
+
+let mode = "raw";          // "raw" | "fft"
+const lastRawSeq = new Map();
+const lastFftSeq = new Map();
+const uPlots    = new Map();      // port -> uPlot instance
+const statusEls = new Map();      // port -> status <span>
+const containers = new Map();     // port -> <div data-plot>
+const statEls   = new Map();      // port -> {x, y, z} stat-value spans
+const cachedData = new Map();     // port -> {raw: [x,y1,y2,y3], fft: [...]} for instant mode swap
+const axisShow  = new Map();      // port -> {x, y, z} (true = visible)
+let timeAxis = null;
+let freqAxis = null;
+let lastSnapshot = null;
+
+// ── activation ───────────────────────────────────────────────────────
+function activateAll(active) {
+  for (const port of PORTS) {
+    fetch("/api/active_port", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port, active }),
+      keepalive: !active,
+    }).catch(() => {});
+  }
+}
+
+// ── uPlot setup ──────────────────────────────────────────────────────
+function getAxisShow(port) {
+  let s = axisShow.get(port);
+  if (!s) { s = { x: true, y: true, z: true }; axisShow.set(port, s); }
+  return s;
+}
+
+function buildOpts(width, port) {
+  const isFft = mode === "fft";
+  const show = getAxisShow(port);
+  const xUnit = isFft ? "Hz" : "ms";
+  const yLabel = isFft ? "Magnitude" : "G";
+
+  // setCursor fires on every mouse move. Read the data at the cursor index
+  // and paint a tooltip in u.over. The tooltip element is attached in
+  // makePlot() after the uPlot is constructed.
+  function updateTooltip(u) {
+    const tt = u.__tooltip;
+    if (!tt) return;
+    const idx = u.cursor.idx;
+    if (idx == null || u.cursor.left < 0) { tt.style.display = "none"; return; }
+    const xVal = u.data[0][idx];
+    const fmtY = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(3);
+    tt.innerHTML =
+      `<div class="tt-x">${isFft ? xVal.toFixed(0) : xVal.toFixed(1)} ${xUnit}</div>` +
+      `<div class="tt-row row-x"><span class="tt-name">X</span><span>${fmtY(u.data[1][idx])} ${yLabel}</span></div>` +
+      `<div class="tt-row row-y"><span class="tt-name">Y</span><span>${fmtY(u.data[2][idx])} ${yLabel}</span></div>` +
+      `<div class="tt-row row-z"><span class="tt-name">Z</span><span>${fmtY(u.data[3][idx])} ${yLabel}</span></div>`;
+    tt.style.left = u.cursor.left + "px";
+    tt.style.top  = u.cursor.top  + "px";
+    tt.style.display = "block";
+  }
+
+  return {
+    width: width,
+    height: PLOT_HEIGHT,
+    pxAlign: false,                    // skip the per-frame pixel-snap pass
+    cursor: {
+      y: false,                    // no horizontal crosshair line
+      drag: { x: false, y: false },
+      points: { show: false },     // no per-series highlight dots
+    },                             // (no `focus` → uPlot won't dim other lines)
+    legend: { show: false },
+    hooks: { setCursor: [updateTooltip] },
+    scales: {
+      x: { time: false },
+      y: { auto: true },
+    },
+    axes: [
+      {
+        label: isFft ? "Frequency (Hz)" : "Time (ms)",
+        labelSize: 22,
+        labelGap: 4,
+        size: 36,
+        stroke: "hsl(240 3.8% 46.1%)",
+        grid: { stroke: "hsl(240 5.9% 90%)", width: 1 },
+        ticks: { stroke: "hsl(240 5.9% 90%)" },
+      },
+      {
+        label: isFft ? "Magnitude" : "Acceleration (G)",
+        labelSize: 22,
+        labelGap: 4,
+        size: 50,
+        stroke: "hsl(240 3.8% 46.1%)",
+        grid: { stroke: "hsl(240 5.9% 90%)", width: 1 },
+        ticks: { stroke: "hsl(240 5.9% 90%)" },
+      },
+    ],
+    series: [
+      {},
+      { label: "X", stroke: AXIS_COLORS.x, width: 1.4, points: { show: false }, show: show.x },
+      { label: "Y", stroke: AXIS_COLORS.y, width: 1.4, points: { show: false }, show: show.y },
+      { label: "Z", stroke: AXIS_COLORS.z, width: 1.4, points: { show: false }, show: show.z },
+    ],
+  };
+}
+
+function placeholderData() {
+  const N = 256;
+  const xs = new Array(N);
+  const zs = new Array(N).fill(0);
+  for (let i = 0; i < N; i++) xs[i] = i;
+  return [xs, zs.slice(), zs.slice(), zs.slice()];
+}
+
+function makePlot(port) {
+  const container = containers.get(port);
+  if (!container) return;
+  const width = container.clientWidth || 400;
+
+  // Try to start with whatever cached data we have for the current mode so
+  // the toggle never flashes empty.
+  const cache = cachedData.get(port);
+  let initial;
+  if (mode === "fft" && cache && cache.fft) initial = cache.fft;
+  else if (mode === "raw" && cache && cache.raw) initial = cache.raw;
+  else initial = placeholderData();
+
+  const u = new uPlot(buildOpts(width, port), initial, container);
+  // Attach a tooltip div to the cursor overlay layer. setCursor reads it
+  // via u.__tooltip; hide it when the mouse leaves the plot.
+  const tt = document.createElement("div");
+  tt.className = "uplot-tooltip";
+  tt.style.display = "none";
+  u.over.appendChild(tt);
+  u.__tooltip = tt;
+  u.over.addEventListener("mouseleave", () => { tt.style.display = "none"; });
+
+  uPlots.set(port, u);
+}
+
+function destroyAllPlots() {
+  for (const u of uPlots.values()) u.destroy();
+  uPlots.clear();
+}
+
+function initPlots() {
+  for (const port of PORTS) {
+    const card = document.querySelector(`.waveform-card[data-port="${port}"]`);
+    if (!card) continue;
+    containers.set(port, card.querySelector("[data-plot]"));
+    statusEls.set(port, card.querySelector("[data-status]"));
+    statEls.set(port, {
+      x: card.querySelector('[data-stat="x"]'),
+      y: card.querySelector('[data-stat="y"]'),
+      z: card.querySelector('[data-stat="z"]'),
+    });
+    // Click any chip to toggle that axis's visibility on this card's plot.
+    for (const ax of ["x", "y", "z"]) {
+      const chip = card.querySelector(`.chip.axis-${ax}`);
+      if (!chip) continue;
+      chip.addEventListener("click", () => toggleAxis(port, ax));
+    }
+    makePlot(port);
+    // Reflect the persisted (or default) show state on the chips.
+    refreshChipDimming(port);
+  }
+  // Resize each uPlot when its container resizes (window resize, sidebar
+  // toggle, etc.).
+  const ro = new ResizeObserver(entries => {
+    for (const entry of entries) {
+      const card = entry.target.closest('.waveform-card');
+      if (!card) continue;
+      const port = card.dataset.port;
+      const u = uPlots.get(port);
+      if (u) u.setSize({ width: entry.contentRect.width, height: PLOT_HEIGHT });
+    }
+  });
+  for (const div of containers.values()) ro.observe(div);
+}
+
+// ── axis toggling ────────────────────────────────────────────────────
+const SERIES_IDX = { x: 1, y: 2, z: 3 };
+
+function refreshChipDimming(port) {
+  const show = getAxisShow(port);
+  const card = document.querySelector(`.waveform-card[data-port="${port}"]`);
+  if (!card) return;
+  for (const ax of ["x", "y", "z"]) {
+    const chip = card.querySelector(`.chip.axis-${ax}`);
+    if (!chip) continue;
+    chip.classList.toggle("hidden", !show[ax]);
+  }
+}
+
+function toggleAxis(port, ax) {
+  const show = getAxisShow(port);
+  show[ax] = !show[ax];
+  const u = uPlots.get(port);
+  if (u) u.setSeries(SERIES_IDX[ax], { show: show[ax] });
+  refreshChipDimming(port);
+}
+
+// ── stats ────────────────────────────────────────────────────────────
+function fmtSigned(v) {
+  // Compact ±N.NN — fits 3 chips per card without wrapping.
+  if (!isFinite(v)) return "—";
+  const s = v >= 0 ? "+" : "";
+  return s + v.toFixed(2);
+}
+
+function computeRawStat(arr) {
+  // [min, max] across the trace. Loop avoids Math.min/max(...arr) which is
+  // O(N) but constructs a giant arg list and can blow the call stack for big N.
+  if (!arr || !arr.length) return null;
+  let lo = arr[0], hi = arr[0];
+  for (let i = 1; i < arr.length; i++) {
+    const v = arr[i];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  return [lo, hi];
+}
+
+function computePeak(arr, freqs) {
+  // (peak magnitude, frequency in Hz). freqs is freq_axis_hz, same length as arr.
+  if (!arr || !arr.length || !freqs) return null;
+  let pi = 0, pv = arr[0];
+  for (let i = 1; i < arr.length; i++) {
+    if (arr[i] > pv) { pv = arr[i]; pi = i; }
+  }
+  return [pv, freqs[pi]];
+}
+
+function updateStats(port, entry) {
+  const cells = statEls.get(port);
+  if (!cells) return;
+  const isFft = mode === "fft";
+  for (const ax of ["x", "y", "z"]) {
+    const cell = cells[ax];
+    if (!cell) continue;
+    let text = "—";
+    if (isFft && entry.fft && entry.fft[ax]) {
+      const peak = computePeak(entry.fft[ax], freqAxis);
+      if (peak) text = `${peak[0].toFixed(3)} @ ${peak[1].toFixed(0)} Hz`;
+    } else if (!isFft && entry.raw && entry.raw[ax]) {
+      const mm = computeRawStat(entry.raw[ax]);
+      if (mm) text = `${fmtSigned(mm[0])} … ${fmtSigned(mm[1])} G`;
+    }
+    setIfChanged(cell, "textContent", text);
+  }
+}
+
+// ── rendering ────────────────────────────────────────────────────────
+function renderPort(port, entry) {
+  const isFft = mode === "fft";
+  const data = isFft ? entry.fft : entry.raw;
+  const axis = isFft ? freqAxis : timeAxis;
+  if (!data || !axis) return;
+
+  const arr = [axis, data.x, data.y, data.z];
+
+  // Cache for instant mode toggle.
+  const cache = cachedData.get(port) || {};
+  if (isFft) cache.fft = arr; else cache.raw = arr;
+  cachedData.set(port, cache);
+
+  const u = uPlots.get(port);
+  if (u) u.setData(arr);
+
+  updateStats(port, entry);
+
+  const status = statusEls.get(port);
+  if (status) {
+    const tsTxt = entry.ts ? new Date(entry.ts * 1000).toLocaleTimeString('en-GB') : "—";
+    const seq = isFft ? (entry.fft_seq || 0) : (entry.raw_seq || 0);
+    setIfChanged(status, "textContent", `${mode} seq ${seq} · ${tsTxt}`);
+  }
+}
+
+function setMode(next) {
+  if (next === mode) return;
+  mode = next;
+  for (const btn of document.querySelectorAll(".mode-toggle button")) {
+    btn.setAttribute("aria-pressed", btn.dataset.mode === mode ? "true" : "false");
+  }
+  // Destroy + recreate so axis labels update. Cheap (~5 ms × 4 charts) and
+  // only happens on user click. makePlot picks up the cached data per port
+  // so the swap shows real data instantly. axisShow is carried into the
+  // rebuilt opts via getAxisShow(port).
+  destroyAllPlots();
+  for (const port of PORTS) { makePlot(port); refreshChipDimming(port); }
+
+  // Stats row also needs to switch from min/max <-> peak. Re-read from the
+  // last snapshot we received — the data hasn't changed, only the format.
+  if (lastSnapshot) {
+    for (const port of PORTS) {
+      const entry = (lastSnapshot.ports || {})[port];
+      if (entry) updateStats(port, entry);
+    }
+  }
+}
+
+function handleSnapshot(data) {
+  lastSnapshot = data;
+  if (data.time_axis_ms) timeAxis = data.time_axis_ms;
+  if (data.freq_axis_hz) freqAxis = data.freq_axis_hz;
+
+  let anyChanged = false;
+  const isFft = mode === "fft";
+  for (const port of PORTS) {
+    const entry = (data.ports || {})[port];
+    if (!entry) continue;
+    const rs = entry.raw_seq || 0;
+    const fs = entry.fft_seq || 0;
+    const rawChanged = lastRawSeq.get(port) !== rs;
+    const fftChanged = lastFftSeq.get(port) !== fs;
+    lastRawSeq.set(port, rs);
+    lastFftSeq.set(port, fs);
+    // Always cache both modes so the toggle is instant. Only redraw the
+    // visible mode.
+    if (entry.raw) {
+      const cache = cachedData.get(port) || {};
+      cache.raw = [timeAxis, entry.raw.x, entry.raw.y, entry.raw.z];
+      cachedData.set(port, cache);
+    }
+    if (entry.fft) {
+      const cache = cachedData.get(port) || {};
+      cache.fft = [freqAxis, entry.fft.x, entry.fft.y, entry.fft.z];
+      cachedData.set(port, cache);
+    }
+    if (isFft) {
+      if (!fftChanged || !entry.fft) continue;
+    } else {
+      if (!rawChanged || !entry.raw) continue;
+    }
+    renderPort(port, entry);
+    anyChanged = true;
+  }
+  if (anyChanged) {
+    const updatedEl = document.getElementById("updated");
+    setIfChanged(updatedEl, "textContent", new Date().toLocaleTimeString('en-GB'));
+  }
+}
+
+// ── boot ────────────────────────────────────────────────────────────
+// uPlot is loaded with `defer` so it's ready by the time this module runs
+// (modules are also deferred and run after deferred external scripts in
+// document order).
+for (const btn of document.querySelectorAll(".mode-toggle button")) {
+  btn.addEventListener("click", () => setMode(btn.dataset.mode));
+}
+
+initPlots();
+activateAll(true);
+
+const evt = new EventSource("/api/waveform_stream");
+evt.onmessage = (e) => {
+  try {
+    handleSnapshot(JSON.parse(e.data));
+  } catch (err) {
+    console.warn("waveform SSE parse error:", err);
+  }
+};
+evt.onerror = () => {
+  console.warn("waveform SSE dropped, browser will retry…");
+};
+
+window.addEventListener("beforeunload", () => {
+  activateAll(false);
+});
+</script>
+{% endblock %}

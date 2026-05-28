@@ -1,0 +1,150 @@
+{% extends "_layout.html" %}
+{% block title %}Settings · npu-classifier{% endblock %}
+
+{% block head %}
+<style>
+  .alias-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .alias-table th, .alias-table td {
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .alias-table th {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted-foreground);
+    font-weight: 600;
+  }
+  .alias-table tr:last-child td { border-bottom: 0; }
+  .port-path {
+    font-variant-numeric: tabular-nums;
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--muted-foreground);
+  }
+  .alias-input {
+    width: 100%;
+    max-width: 320px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--background);
+    color: var(--foreground);
+    font: inherit;
+    font-size: 13px;
+  }
+  .alias-input:focus {
+    outline: 2px solid var(--ring);
+    outline-offset: -1px;
+  }
+  .alias-status {
+    font-size: 11px;
+    color: var(--muted-foreground);
+    margin-left: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .alias-status.saved { color: hsl(142 71% 35%); }
+  .alias-status.error { color: var(--destructive); }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Settings</h1>
+    <div class="page-subtitle">Friendly names for sensor ports. Saved instantly.</div>
+  </div>
+</div>
+
+<section class="card">
+  <div class="card-header">
+    <h2 class="card-title">Port aliases</h2>
+  </div>
+  <div class="card-content" style="padding: 0;">
+    {% if ports %}
+    <table class="alias-table">
+      <thead>
+        <tr>
+          <th>Port</th>
+          <th>Display name</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in ports %}
+        <tr>
+          <td><span class="port-path">{{ p }}</span></td>
+          <td>
+            <input class="alias-input" data-port="{{ p }}" type="text"
+                   value="{{ aliases.get(p, '') }}"
+                   placeholder="(default: {{ p }})">
+            <span class="alias-status" data-status-for="{{ p }}"></span>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty" style="margin: 20px;">No sensors connected.</div>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script type="module">
+import { setIfChanged } from "{{ url_for('static', filename='app.js') }}";
+
+// Debounce per-port: don't fire a POST on every keystroke. 500 ms after the
+// user stops typing, save. Showing the saved status is the only user feedback.
+const timers = new Map();
+const DEBOUNCE_MS = 500;
+
+function save(port, alias) {
+  const status = document.querySelector(`[data-status-for="${port}"]`);
+  if (status) setIfChanged(status, "textContent", "saving…");
+  status?.classList.remove("saved", "error");
+  fetch("/api/port_alias", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ port, alias }),
+  }).then(r => r.json()).then(d => {
+    if (d.error) {
+      if (status) {
+        setIfChanged(status, "textContent", d.error);
+        status.classList.add("error");
+      }
+    } else {
+      if (status) {
+        setIfChanged(status, "textContent", "saved");
+        status.classList.add("saved");
+      }
+    }
+  }).catch(err => {
+    if (status) {
+      setIfChanged(status, "textContent", "network error");
+      status.classList.add("error");
+    }
+  });
+}
+
+for (const input of document.querySelectorAll(".alias-input")) {
+  input.addEventListener("input", () => {
+    const port = input.dataset.port;
+    clearTimeout(timers.get(port));
+    timers.set(port, setTimeout(() => save(port, input.value), DEBOUNCE_MS));
+  });
+  input.addEventListener("blur", () => {
+    const port = input.dataset.port;
+    if (timers.has(port)) {
+      clearTimeout(timers.get(port));
+      timers.delete(port);
+      save(port, input.value);
+    }
+  });
+}
+</script>
+{% endblock %}

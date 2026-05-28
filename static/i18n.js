@@ -5,11 +5,32 @@
   // ── Exact-match dictionary ────────────────────────────────────────────
   const ZH = {
     // Nav + sidebar
+    'Live waveform': '即時波形',
     'Live inference': '即時推論',
     'Data recording': '資料錄製',
     'Train model': '訓練模型',
+    'Settings': '設定',
     'inference': '推論',
     'sensors': '感測器',
+
+    // Settings page
+    'Friendly names for sensor ports. Saved instantly.': '為感測器埠設定友善名稱，會即時儲存。',
+    'Port aliases': '埠別名',
+    'Port': '埠',
+    'Display name': '顯示名稱',
+    'No sensors connected.': '無感測器連接。',
+    'saving…': '儲存中…',
+    'saved': '已儲存',
+
+    // Page subtitles — Live waveform
+    'Raw': '原始',
+    'FFT': '頻譜',
+    'Time (ms)': '時間 (毫秒)',
+    'Frequency (Hz)': '頻率 (Hz)',
+    'Acceleration (G)': '加速度 (G)',
+    'Magnitude': '幅值',
+    'no sensors connected': '無感測器連接',
+    'FFT backend': 'FFT 後端',
 
     // Page subtitles — Dashboard
     'Updated': '更新於',
