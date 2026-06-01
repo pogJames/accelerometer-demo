@@ -1,6 +1,24 @@
 {% extends "_layout.html" %}
 {% block title %}Data recording · npu-classifier{% endblock %}
 
+{% block head %}
+<style>
+  /* Per-row delete: ghost by default, destructive on hover (shadcn). */
+  .btn-delete {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px;
+    border: 1px solid transparent; border-radius: var(--radius);
+    background: transparent; color: var(--muted-foreground);
+    cursor: pointer; transition: background 80ms ease, color 80ms ease, border-color 80ms ease;
+  }
+  .btn-delete:hover {
+    background: hsl(0 72% 97%); color: var(--destructive); border-color: var(--border);
+  }
+  .btn-delete .icon { width: 15px; height: 15px; }
+  .table td.actions { text-align: right; width: 1%; white-space: nowrap; }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="page-header">
   <div>
@@ -23,6 +41,7 @@
           <th class="num">Duration</th>
           <th class="num">Size</th>
           <th>Last modified</th>
+          <th></th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -225,6 +244,15 @@ async function refreshRecordings() {
         <td class="num">${dur.toFixed(1)} s</td>
         <td class="num">${fmtBytes(l.file_size)}</td>
         <td>${fmtRelative(l.mtime)}</td>
+        <td class="actions">
+          <button class="btn-delete" data-del="${l.name}" title="Delete recording" aria-label="Delete recording">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
+              <path d="M10 11v6M14 11v6"/>
+            </svg>
+          </button>
+        </td>
       `;
       tbody.appendChild(tr);
     }
@@ -321,6 +349,51 @@ startBtn.addEventListener("click", async () => {
   } catch (err) {
     showToast(String(err), { error: true });
     refreshStartEnabled();
+  }
+});
+
+// --- Delete handler ---
+labelsTable.addEventListener("click", async (e) => {
+  // Check if the clicked element (or its parent) is our delete button
+  const deleteBtn = e.target.closest('.btn-delete');
+  if (!deleteBtn) return;
+
+  // Extract the recording name from the data-del attribute
+  const recordingName = deleteBtn.dataset.del; // clean dataset alternative to getAttribute
+
+  // 1. Confirm with the user
+  if (!confirm(`Are you sure you want to delete the recording "${recordingName}"?`)) {
+    return;
+  }
+
+  // 2. Disable the button visually while processing
+  deleteBtn.disabled = true;
+  deleteBtn.style.opacity = '0.5';
+
+  try {
+    // 3. Send the request (Adjust URL/Method if your Flask app uses something else!)
+    const response = await fetch('/api/recordings/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: recordingName })
+    });
+
+    const result = await response.json();
+
+    if (response.ok) {
+      // 4. Success! Toast and refresh to handle table empty states naturally
+      showToast(`Deleted recording "${recordingName}"`);
+      refreshRecordings();
+    } else {
+      showToast(result.error || 'Failed to delete the recording.', { error: true });
+      deleteBtn.disabled = false;
+      deleteBtn.style.opacity = '1';
+    }
+  } catch (error) {
+    console.error('Delete error:', error);
+    showToast('A network error occurred while trying to delete.', { error: true });
+    deleteBtn.disabled = false;
+    deleteBtn.style.opacity = '1';
   }
 });
 

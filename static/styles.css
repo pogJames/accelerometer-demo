@@ -39,6 +39,19 @@
   --c8: hsl(330 81% 60%);  /* pink   */
   --c9: hsl(215 19% 47%);  /* slate  */
 
+  /* Tri-axial accent palette — single source of truth for the X/Y/Z colours
+     used by the waveform plots, the FFT/raw stat chips and the metrics
+     tables. Mapped onto the label palette so everything stays in one system. */
+  --axis-x: var(--c0);   /* red   */
+  --axis-y: var(--c3);   /* green */
+  --axis-z: var(--c5);   /* blue  */
+
+  /* Typography + elevation tokens (were repeated literally across files). */
+  --font-sans: 'Inter', 'Noto Sans TC', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --shadow-sm: 0 1px 2px hsl(240 5% 10% / 0.04);
+  --shadow-md: 0 6px 16px hsl(240 5% 10% / 0.12);
+
   --header-h: 56px;
 }
 
@@ -50,7 +63,7 @@ html, body {
   scrollbar-gutter: stable;
   background: var(--background);
   color: var(--foreground);
-  font-family: 'Inter', 'Noto Sans TC', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: var(--font-sans);
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
@@ -189,14 +202,15 @@ a { color: inherit; text-decoration: none; }
   color: var(--card-foreground);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 1px 2px hsl(240 5% 10% / 0.04);
+  box-shadow: var(--shadow-sm);
 }
 .card + .card { margin-top: 16px; }
 .card-header {
   padding: 16px 20px;
   border-bottom: 1px solid var(--border);
 }
-.card-title { font-size: 15px; font-weight: 600; margin: 0; }.card-content { padding: 20px; }
+.card-title { font-size: 15px; font-weight: 600; margin: 0; }
+.card-content { padding: 20px; }
 
 /* shadcn-style Accordion — one container, flush items, inner dividers */
 .grid {
@@ -206,7 +220,7 @@ a { color: inherit; text-decoration: none; }
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 1px 2px hsl(240 5% 10% / 0.04);
+  box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
 .port-card + .port-card { border-top: 1px solid var(--border); }
@@ -329,7 +343,7 @@ a { color: inherit; text-decoration: none; }
   letter-spacing: 0.02em;
   text-transform: lowercase;
 }
-.badge.npu  { background: hsl(220 90% 95%); color: hsl(220 80% 35%); }
+.badge.npu  { background: hsl(271 91% 96%); color: hsl(271 70% 45%); }
 .badge.cpu  { background: hsl(38 92% 95%);  color: hsl(38 80% 35%); }
 .badge.stub { background: var(--muted);     color: var(--muted-foreground); }
 
@@ -367,6 +381,8 @@ a { color: inherit; text-decoration: none; }
   border-color: var(--ring);
   box-shadow: 0 0 0 3px hsl(240 5% 10% / 0.08);
 }
+/* Numeric entry fields read as data — render them in JetBrains Mono. */
+input[type="number"] { font-family: var(--font-mono); }
 
 .segmented {
   display: inline-flex;
@@ -452,7 +468,7 @@ a { color: inherit; text-decoration: none; }
 .kv { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 8px; }
 .kv > div { display: flex; flex-direction: column; gap: 2px; }
 .kv .k { font-size: 11px; color: var(--muted-foreground); text-transform: uppercase; letter-spacing: 0.04em; }
-.kv .v { font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.kv .v { font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
 
 /* table */
 .table {
@@ -475,7 +491,7 @@ a { color: inherit; text-decoration: none; }
   letter-spacing: 0.04em;
 }
 .table tr:last-child td { border-bottom: none; }
-.table .num { font-variant-numeric: tabular-nums;}
+.table .num { font-variant-numeric: tabular-nums; font-family: var(--font-mono); }
 
 .toast {
   position: fixed;
@@ -484,7 +500,7 @@ a { color: inherit; text-decoration: none; }
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 6px 16px hsl(240 5% 10% / 0.12);
+  box-shadow: var(--shadow-md);
   padding: 12px 16px;
   font-size: 13px;
   max-width: 360px;

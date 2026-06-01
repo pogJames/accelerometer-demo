@@ -1,10 +1,15 @@
 """Per-port live-waveform aggregator for the / dashboard.
 
-The waveform worker thread calls `WaveformAggregator.publish(port, window)`
-on every window it pulls off the in-process fan-out queue. Both raw and FFT
-compute on every call — no throttling. Raw shows the freshest hop (the last
-window_size//2 samples), FFT uses the full window so frequency resolution
-stays at sample_rate/window_size ≈ 3 Hz/bin.
+Fed by a fast raw-sample stream (sensor_reader emits ~217-sample chunks at
+~36 Hz/port → app.py drain thread → `append(port, chunk)`), which writes into
+a per-port circular buffer. A display-tick thread (~30 Hz) calls
+`render_tick()`, which reads the last N samples from each ring, smooths +
+decimates the raw view and (at ~6 Hz) recomputes the FFT, then stores a
+per-port snapshot. `snapshot()` is a cheap pure read for the SSE handlers.
+
+Because the ring advances under a large overlapping window, the raw view
+scrolls smoothly instead of flashing discrete hops, and "Latest N samples"
+can span up to ~1 s.
 
 FFT uses pyfftw with cached FFTW plans (so NEON SIMD on aarch64 actually
 runs). Falls back to numpy.fft.rfft if pyfftw isn't installed.
@@ -16,10 +21,12 @@ import time
 import numpy as np
 
 
-WINDOW_SIZE      = 2604
+WINDOW_SIZE      = 3906
 SAMPLE_RATE      = 7812
 DISPLAY_POINTS   = 256
 MIN_RAW_SAMPLES  = 32       # floor for the user-set raw window (savgol needs a few)
+RING_CAPACITY    = SAMPLE_RATE * 2     # ~2 s of history per port
+FFT_INTERVAL_S   = 1.0 / 4.0           # recompute FFT ~6 Hz (the old window rate)
 
 SAVGOL_WINDOW    = 11
 SAVGOL_POLYORDER = 3
@@ -120,27 +127,24 @@ class WaveformAggregator:
     thread on every window; throttle and compute happen inline. snapshot()
     is called from Flask request threads to read the latest state."""
 
-    def __init__(self, ports, on_publish=None,
-                 window_size=WINDOW_SIZE, sample_rate=SAMPLE_RATE,
-                 display_points=DISPLAY_POINTS):
+    def __init__(self, ports, window_size=WINDOW_SIZE, sample_rate=SAMPLE_RATE,
+                 display_points=DISPLAY_POINTS, ring_capacity=RING_CAPACITY):
         self.window_size = window_size
         self.sample_rate = sample_rate
         self.display_points = display_points
-        self._on_publish = on_publish
+        self._ports = list(ports)
+        self._ring_cap = ring_capacity
 
         # How many of the most recent samples raw mode shows — user-tunable
-        # (set_raw_samples). Capped at the window we receive (no ring buffer);
-        # default is half the window (the freshest hop).
-        self.raw_max_samples = window_size
-        self.raw_samples = min(window_size // 2, window_size)
+        # (set_raw_samples). The ring now holds ~2 s, so this can span up to
+        # ~1 s. Default ≈ the old freshest-hop view.
+        self.raw_max_samples = sample_rate                 # up to 1 s
+        self.raw_samples = min(window_size // 2, self.raw_max_samples)
 
-        # How many low-frequency FFT bins to ship — user-tunable from the UI
-        # (set_fft_max_hz). Each bin is sample_rate/window_size ≈ 3 Hz wide;
-        # the cap is the rFFT's Nyquist bin count (window_size//2). Default is
-        # the lower half of what raw covers — the demo rig has no motor fast
-        # enough to excite higher bins.
+        # FFT bin count (user-tunable, set_fft_max_hz). bin = sample_rate/
+        # window_size ≈ 3 Hz; cap at the rFFT Nyquist bin count.
         self.bin_hz = sample_rate / window_size
-        self.fft_max_bins = window_size // 2     # Nyquist
+        self.fft_max_bins = window_size // 2
         self.fft_bins = min(display_points // 2, self.fft_max_bins)
 
         self._lock = threading.Lock()
@@ -148,31 +152,32 @@ class WaveformAggregator:
         self._raw_seq = {p: 0 for p in ports}
         self._fft_seq = {p: 0 for p in ports}
 
-        # One FFTW plan per port (avoid contention since three axes per call
-        # are serialised inside publish() anyway). Plans get the MEASURE-grade
-        # one-shot cost at first use, not at construction.
+        # Per-port circular sample buffer. _ring_w = next write index,
+        # _ring_n = total samples ever written (monotonic), _rendered_n =
+        # _ring_n at the last render (skip recompute when no new data).
+        self._ring = {p: np.zeros((ring_capacity, 3), dtype=np.float32) for p in ports}
+        self._ring_w = {p: 0 for p in ports}
+        self._ring_n = {p: 0 for p in ports}
+        self._rendered_n = {p: 0 for p in ports}
+        self._last_fft_t = {p: 0.0 for p in ports}
+
         self._plans = {p: _make_fft_plan(window_size) for p in ports}
 
-        # Axes shipped to the client. raw_axis is "samples ago" ascending
-        # (0 = latest); the client renders it with a reversed x-scale so 0
-        # lands on the right. freq_axis_hz is the FFT bin centre frequencies.
         self.raw_axis = self._make_raw_axis(self.raw_samples)
         self.freq_axis_hz = self._make_freq_axis(self.fft_bins)
 
+    # ── axes / setters ────────────────────────────────────────────────
     def _make_freq_axis(self, bins):
         return (np.arange(1, bins + 1, dtype=np.float32) * self.bin_hz).tolist()
 
     def _make_raw_axis(self, n):
         """'Samples ago' axis, ascending 0..n-1, length min(n, display_points).
-        0 is the latest sample; the client reverses the scale so it sits on
-        the right edge while the tick labels stay nicely rounded."""
+        0 = latest sample; the client reverses the scale so it sits on the
+        right edge while tick labels stay rounded."""
         m = min(n, self.display_points)
         return np.linspace(0.0, n - 1, m, dtype=np.float32).tolist()
 
     def set_fft_max_hz(self, hz):
-        """Set the upper frequency shown in FFT mode. Converts to a bin count
-        (each bin ≈ bin_hz), clamps to [1, Nyquist], and rebuilds the freq
-        axis. Returns the actual max frequency applied (bins * bin_hz)."""
         bins = int(round(float(hz) / self.bin_hz))
         bins = max(1, min(bins, self.fft_max_bins))
         axis = self._make_freq_axis(bins)
@@ -182,8 +187,6 @@ class WaveformAggregator:
         return bins * self.bin_hz
 
     def set_raw_samples(self, n):
-        """Set how many of the most recent samples raw mode shows. Clamps to
-        [MIN_RAW_SAMPLES, window]. Returns the applied count."""
         n = max(MIN_RAW_SAMPLES, min(int(n), self.raw_max_samples))
         axis = self._make_raw_axis(n)
         with self._lock:
@@ -191,86 +194,133 @@ class WaveformAggregator:
             self.raw_axis = axis
         return n
 
-    def publish(self, port, window):
-        """Called from the waveform worker thread on every window. Both raw
-        and FFT compute on every call — no throttle. Each publish bumps the
-        bus once, so the SSE pushes both freshly-computed views together."""
-        try:
-            raw_xyz = self._compute_raw(window)
-        except Exception as e:
-            print(f"[waveform] raw compute failed for {port}: {e}")
+    # ── ingest ────────────────────────────────────────────────────────
+    def append(self, port, chunk):
+        """Write a fresh (k, 3) sample chunk into the port's ring buffer.
+        Called from the raw_queue drain thread (~36 Hz/port). Cheap memcpy."""
+        if port not in self._ring:
             return
+        k = chunk.shape[0]
+        cap = self._ring_cap
+        with self._lock:
+            ring = self._ring[port]
+            w = self._ring_w[port]
+            if k >= cap:
+                ring[:] = chunk[-cap:]
+                self._ring_w[port] = 0
+            elif w + k <= cap:
+                ring[w:w + k] = chunk
+                self._ring_w[port] = (w + k) % cap
+            else:
+                first = cap - w
+                ring[w:] = chunk[:first]
+                ring[:k - first] = chunk[first:]
+                self._ring_w[port] = k - first
+            self._ring_n[port] += k
 
-        try:
-            fft_xyz = self._compute_fft(port, window)
-        except Exception as e:
-            print(f"[waveform] fft compute failed for {port}: {e}")
+    def _tail_locked(self, port, n):
+        """Last `n` samples (oldest→latest), honoring wrap. Caller holds lock.
+        Returns None if fewer than `n` samples have been written."""
+        total = self._ring_n[port]
+        if total < n:
+            return None
+        cap = self._ring_cap
+        ring = self._ring[port]
+        start = (self._ring_w[port] - n) % cap
+        if start + n <= cap:
+            return ring[start:start + n].copy()
+        return np.concatenate([ring[start:], ring[:(start + n) - cap]], axis=0)
+
+    # ── render (display tick) ─────────────────────────────────────────
+    def render_tick(self):
+        """Recompute per-port snapshots from the rings. Called by the display-
+        tick thread at TICK_HZ. Raw recomputed every tick (scroll); FFT only
+        ~every FFT_INTERVAL_S. Skips ports with no new samples since last
+        render. Returns True if anything changed (caller bumps the bus)."""
+        now = time.monotonic()
+        with self._lock:
+            raw_n = self.raw_samples
+            fft_bins = self.fft_bins
+            jobs = {}
+            for port in self._ports:
+                if self._ring_n[port] == self._rendered_n[port]:
+                    continue
+                raw_tail = self._tail_locked(port, raw_n)
+                if raw_tail is None:
+                    continue            # ring not full enough yet → 'waiting…'
+                do_fft = (now - self._last_fft_t[port]) >= FFT_INTERVAL_S
+                fft_tail = self._tail_locked(port, self.window_size) if do_fft else None
+                if fft_tail is not None:
+                    self._last_fft_t[port] = now
+                self._rendered_n[port] = self._ring_n[port]
+                jobs[port] = (raw_tail, fft_tail)
+        if not jobs:
+            return False
+
+        # Heavy compute OUTSIDE the lock.
+        results = {}
+        for port, (raw_tail, fft_tail) in jobs.items():
+            raw_xyz = self._raw_from_tail(raw_tail)
             fft_xyz = None
+            if fft_tail is not None:
+                try:
+                    fft_xyz = self._fft_from_tail(self._plans[port], fft_tail, fft_bins)
+                except Exception as e:
+                    print(f"[waveform] fft compute failed for {port}: {e}")
+            results[port] = (raw_xyz, fft_xyz)
 
         with self._lock:
-            self._raw_seq[port] += 1
-            entry = {
-                "raw_seq": self._raw_seq[port],
-                "raw": raw_xyz,
-                "ts": time.time(),
-                "fft_seq": self._fft_seq[port],
-                "fft": (self._latest.get(port) or {}).get("fft"),
-            }
-            if fft_xyz is not None:
-                self._fft_seq[port] += 1
-                entry["fft_seq"] = self._fft_seq[port]
-                entry["fft"] = fft_xyz
-            self._latest[port] = entry
+            for port, (raw_xyz, fft_xyz) in results.items():
+                self._raw_seq[port] += 1
+                prev = self._latest.get(port) or {}
+                entry = {
+                    "raw_seq": self._raw_seq[port],
+                    "raw": raw_xyz,
+                    "ts": time.time(),
+                    "fft_seq": prev.get("fft_seq", 0),
+                    "fft": prev.get("fft"),
+                }
+                if fft_xyz is not None:
+                    self._fft_seq[port] += 1
+                    entry["fft_seq"] = self._fft_seq[port]
+                    entry["fft"] = fft_xyz
+                self._latest[port] = entry
+        return True
 
-        if self._on_publish is not None:
-            self._on_publish()
-
-    def _compute_raw(self, window):
-        """Smoothed view of the last `raw_samples` rows, ordered latest→oldest
-        so it lines up with the ascending 'samples ago' raw_axis (the client's
-        reversed x-scale then puts the latest sample on the right)."""
-        n = self.raw_samples
+    def _raw_from_tail(self, tail):
+        """Smoothed, decimated, reversed ('samples ago') view of a tail of
+        length raw_samples → display_points points."""
+        n = tail.shape[0]
         m = min(n, self.display_points)
-        tail = window[-n:, :]
-        # Output positions correspond to raw_axis = linspace(0, n-1, m), i.e.
-        # "samples ago". src maps each to a tail index (latest = n-1 first).
         x_ago = np.linspace(0.0, n - 1, m)
         src = np.clip((n - 1 - x_ago).round().astype(int), 0, n - 1)
         out = {}
-        for axis_idx, axis_name in enumerate(("x", "y", "z")):
-            axis = np.ascontiguousarray(tail[:, axis_idx], dtype=np.float32)
-            smoothed = _savgol(axis)
-            out[axis_name] = smoothed[src].astype(np.float32).tolist()
+        for i, name in enumerate(("x", "y", "z")):
+            axis = np.ascontiguousarray(tail[:, i], dtype=np.float32)
+            sm = _savgol(axis)
+            out[name] = sm[src].astype(np.float32).tolist()
         return out
 
-    def _compute_fft(self, port, window):
-        """Magnitude of the first fft_bins rFFT bins (DC excluded) of the full
-        2604-sample window, per axis. Uses the cached FFTW plan."""
-        plan = self._plans[port]
-        bins = self.fft_bins        # snapshot once — may change mid-stream
+    def _fft_from_tail(self, plan, tail, bins):
+        """Magnitude of the first `bins` rFFT bins (DC excluded) of a
+        window_size-length tail, per axis."""
         out = {}
-        for axis_idx, axis_name in enumerate(("x", "y", "z")):
-            axis = np.ascontiguousarray(window[:, axis_idx], dtype=np.float32)
+        for i, name in enumerate(("x", "y", "z")):
+            axis = np.ascontiguousarray(tail[:, i], dtype=np.float32)
             mag = _run_fft_plan(plan, axis)
-            out[axis_name] = mag[1:1 + bins].astype(np.float32).tolist()
+            out[name] = mag[1:1 + bins].astype(np.float32).tolist()
         return out
 
+    # ── read (SSE) ────────────────────────────────────────────────────
     def snapshot(self):
-        """Build the SSE payload. Cheap — copies the cached per-port dicts."""
+        """Cheap pure read of the latest per-port snapshots + axes."""
         with self._lock:
             ports_out = {}
-            for port, entry in self._latest.items():
-                if entry is None:
-                    ports_out[port] = {
-                        "raw_seq": 0,
-                        "fft_seq": 0,
-                        "ts": None,
-                        "raw": None,
-                        "fft": None,
-                    }
-                else:
-                    ports_out[port] = entry
-            # read under lock — the setters swap value+axis together
+            for port in self._ports:
+                entry = self._latest.get(port)
+                ports_out[port] = entry if entry is not None else {
+                    "raw_seq": 0, "fft_seq": 0, "ts": None, "raw": None, "fft": None,
+                }
             freq_axis = self.freq_axis_hz
             fft_bins = self.fft_bins
             raw_axis = self.raw_axis

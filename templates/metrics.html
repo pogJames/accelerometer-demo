@@ -1,0 +1,215 @@
+{% extends "_layout.html" %}
+{% block title %}Metrics data · npu-classifier{% endblock %}
+
+{% block head %}
+<style>
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+  }
+  @media (max-width: 1100px) { .metrics-grid { grid-template-columns: 1fr; } }
+
+  .metrics-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
+    padding: 16px 18px;
+  }
+  .metrics-card header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .metrics-card .port {
+    font-size: 13px; font-weight: 600;
+    letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .metrics-card .status {
+    font-size: 11px; color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums; font-family: var(--font-mono);
+  }
+  .temp-line {
+    font-size: 14px; margin-bottom: 8px;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted-foreground);
+    font-weight: 500;
+  }
+  .temp-line b { font-size: 20px; font-weight: 700; }
+
+  .metric-group-title {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--muted-foreground); margin: 10px 0 4px;
+  }
+  table.metric-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table.metric-table th, table.metric-table td {
+    padding: 4px 6px; text-align: right; font-size: 13px;
+    border-bottom: 1px solid var(--border);
+  }
+  table.metric-table th:first-child, table.metric-table td:first-child {
+    text-align: left; color: var(--muted-foreground); font-weight: 500;
+  }
+  table.metric-table thead th {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--muted-foreground); font-weight: 600;
+  }
+  table.metric-table tr:last-child td { border-bottom: 0; }
+  /* Value columns: palette X/Y/Z colours + JetBrains Mono for the numbers. */
+  .axis-x { color: var(--axis-x); font-family: var(--font-mono); }
+  .axis-y { color: var(--axis-y); font-family: var(--font-mono); }
+  .axis-z { color: var(--axis-z); font-family: var(--font-mono); }
+  /* Temperature + primary-frequency readouts use the palette purple. */
+  .metric-accent { color: var(--c7); font-weight: 600; font-family: var(--font-mono); }
+  .freq-line { font-size: 13px; color: var(--muted-foreground); margin-top: 4px; margin-bottom: 8px; font-variant-numeric: tabular-nums; font-weight: 500;}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Metrics data</h1>
+    <div class="page-subtitle">
+      Updated <span id="updated">never</span>
+    </div>
+  </div>
+</div>
+
+<div id="metrics-grid" class="metrics-grid">
+  {% for p in ports %}
+  <div class="metrics-card" data-port="{{ p }}">
+    <header>
+      <span class="port" title="{{ p }}">{{ aliases.get(p, p) }}</span>
+      <span class="status" data-status>waiting…</span>
+    </header>
+
+    <div class="temp-line">Temperature <b class="metric-accent" data-cell="temperature">—</b> °C</div>
+
+    <table class="metric-table">
+      <thead><tr><th class="metric-group-title">Gravity (G)</th><th class="axis-x">X</th><th class="axis-y">Y</th><th class="axis-z">Z</th></tr></thead>
+      <tbody>
+        {% for m in ["rms", "peak", "crest", "skewness", "kurtosis"] %}
+        <tr>
+          <td>{{ {"rms":"RMS","peak":"Peak","crest":"Crest","skewness":"Skewness","kurtosis":"Kurtosis"}[m] }}</td>
+          <td class="axis-x" data-cell="gravity:{{ m }}:0">—</td>
+          <td class="axis-y" data-cell="gravity:{{ m }}:1">—</td>
+          <td class="axis-z" data-cell="gravity:{{ m }}:2">—</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="freq-line">Primary frequency <span class="metric-accent" data-cell="gravity:primary_freq">—</span> Hz</div>
+
+    <table class="metric-table">
+      <thead><tr><th class="metric-group-title">Velocity (mm/s)</th><th class="axis-x">X</th><th class="axis-y">Y</th><th class="axis-z">Z</th></tr></thead>
+      <tbody>
+        {% for m in ["rms", "peak", "crest"] %}
+        <tr>
+          <td>{{ {"rms":"RMS","peak":"Peak","crest":"Crest"}[m] }}</td>
+          <td class="axis-x" data-cell="velocity:{{ m }}:0">—</td>
+          <td class="axis-y" data-cell="velocity:{{ m }}:1">—</td>
+          <td class="axis-z" data-cell="velocity:{{ m }}:2">—</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="freq-line">Primary frequency <span class="metric-accent" data-cell="velocity:primary_freq">—</span> Hz</div>
+  </div>
+  {% else %}
+  <div class="empty">No sensors connected (check <code>ALLOWED_PORTS</code> in <code>sensor_reader.py</code>).</div>
+  {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="module">
+import { setIfChanged } from "{{ url_for('static', filename='app.js') }}";
+
+const PORTS = {{ ports|tojson }};
+const cells = new Map();   // port -> { "gravity:rms:0": <td>, ... }
+
+for (const port of PORTS) {
+  const card = document.querySelector(`.metrics-card[data-port="${port}"]`);
+  if (!card) continue;
+  const map = {};
+  for (const el of card.querySelectorAll("[data-cell]")) map[el.dataset.cell] = el;
+  map.__status = card.querySelector("[data-status]");
+  cells.set(port, map);
+}
+
+// Open metric polling for every port on load; close on unload so the readers
+// stop the FC03 traffic when nobody's watching.
+function setMetricsActive(active) {
+  for (const port of PORTS) {
+    fetch("/api/metrics_active", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port, active }),
+      keepalive: !active,
+    }).catch(() => {});
+  }
+}
+
+const fmtTriple = (v) => (v == null ? "—" : Number(v).toFixed(3));
+const fmtVel    = (v) => (v == null ? "—" : Number(v).toFixed(2));
+const fmtTemp   = (v) => (v == null ? "—" : Number(v).toFixed(1));
+const fmtFreq   = (v) => (v == null ? "—" : Number(v).toFixed(0));
+
+function renderPort(port, snap) {
+  const map = cells.get(port);
+  if (!map) return;
+  if (!snap) return;
+
+  setIfChanged(map["temperature"], "textContent", fmtTemp(snap.temperature));
+
+  const g = snap.gravity || {};
+  for (const m of ["rms", "peak", "crest", "skewness", "kurtosis"]) {
+    const arr = g[m] || [];
+    for (let i = 0; i < 3; i++) {
+      const el = map[`gravity:${m}:${i}`];
+      if (el) setIfChanged(el, "textContent", fmtTriple(arr[i]));
+    }
+  }
+  setIfChanged(map["gravity:primary_freq"], "textContent", fmtFreq(g.primary_freq));
+
+  const v = snap.velocity || {};
+  for (const m of ["rms", "peak", "crest"]) {
+    const arr = v[m] || [];
+    for (let i = 0; i < 3; i++) {
+      const el = map[`velocity:${m}:${i}`];
+      if (el) setIfChanged(el, "textContent", fmtVel(arr[i]));
+    }
+  }
+  setIfChanged(map["velocity:primary_freq"], "textContent", fmtFreq(v.primary_freq));
+
+  if (map.__status) {
+    const tsTxt = snap.ts ? new Date(snap.ts * 1000).toLocaleTimeString('en-GB') : "—";
+    setIfChanged(map.__status, "textContent", tsTxt);
+  }
+}
+
+function handleSnapshot(data) {
+  const ports = data.ports || {};
+  let any = false;
+  for (const port of PORTS) {
+    if (ports[port]) { renderPort(port, ports[port]); any = true; }
+  }
+  if (any) {
+    const el = document.getElementById("updated");
+    setIfChanged(el, "textContent", new Date().toLocaleTimeString('en-GB'));
+  }
+}
+
+setMetricsActive(true);
+
+const evt = new EventSource("/api/metrics_stream");
+evt.onmessage = (e) => {
+  try { handleSnapshot(JSON.parse(e.data)); }
+  catch (err) { console.warn("metrics SSE parse error:", err); }
+};
+evt.onerror = () => { console.warn("metrics SSE dropped, browser will retry…"); };
+
+window.addEventListener("beforeunload", () => setMetricsActive(false));
+</script>
+{% endblock %}

@@ -28,10 +28,15 @@ import numpy as np
 import serial
 
 # Up to 4 sensors. Add /dev/ttyUSB1..USB3 here as more come online.
-ALLOWED_PORTS = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2', '/dev/ttyUSB3']
+ALLOWED_PORTS = ['/dev/ttyUSB0']
 
 WINDOW_SIZE   = 2604     # 1/2 sec at 7812 Hz — must match the trained backbone
-HOP_SIZE      = 1302     # 50 % overlap → 4 emits/sec
+HOP_SIZE      = 1302     # 50 % overlap → ~6 window emits/sec (inference path)
+# Second, faster cadence for the live waveform: emit a small chunk of fresh
+# samples every RAW_CHUNK_SIZE (≈36 Hz/port at 7812 Hz). The waveform ring
+# buffer (waveform.py) accumulates these; inference keeps using the slower
+# 2604-window stream above.
+RAW_CHUNK_SIZE = 217
 MAX_PACKET    = 41 * 3   # Modbus packet upper bound: 41 XYZ triplets
 TURN_GRAVITY  = 8192     # raw int16 / 8192 -> G value
 SAMPLE_RATE   = 7812
@@ -52,6 +57,54 @@ READ_TIMEOUT_S          = 0.05
 # Picks up wedged FTDI/CDC drivers and resyncs the framer.
 RECONNECT_AFTER_FAILS   = 5
 
+# ── Computed-metric registers (FC03 holding registers) ────────────────────
+# Addresses + scaling mirror the validated Rust client (src/types.rs,
+# src/modbus.rs). Each metric is its OWN FC03 read of `count` registers at its
+# base address — the addresses alias, so we do NOT read one contiguous block.
+REG_TEMPERATURE        = 0x0014   # 1 reg, value / 100  -> °C
+REG_GRAVITY_RMS        = 0x001E   # 3 regs (x,y,z), / 1000
+REG_GRAVITY_PEAK       = 0x001F   # 3 regs, / 1000
+REG_GRAVITY_CREST      = 0x0020   # 3 regs, / 1000
+REG_GRAVITY_SKEWNESS   = 0x0021   # 3 regs, / 1000  (slow: 2-5 s update)
+REG_GRAVITY_KURTOSIS   = 0x0022   # 3 regs, / 1000  (slow: 2-5 s update)
+REG_GRAVITY_PRIM_FREQ  = 0x003D   # 1 reg, raw Hz
+REG_VELOCITY_RMS       = 0x0032   # 3 regs, / 100
+REG_VELOCITY_PEAK      = 0x0033   # 3 regs, / 100
+REG_VELOCITY_CREST     = 0x0034   # 3 regs, / 100
+REG_VELOCITY_PRIM_FREQ = 0x003C   # 1 reg, raw Hz
+
+# Metric polling cadence. We poll kurtosis (the slowest metric) at this rate
+# and only emit a full batch when it changes — so the whole metric set updates
+# together at the slow 2-5 s kurtosis cadence rather than spamming the fast
+# ones. METRIC_FALLBACK_S forces a refresh even if kurtosis sits perfectly
+# still. (The Rust reference instead polls everything at a flat 5 Hz; swap
+# KURT change-detection for a fixed interval here if that's preferred.)
+KURT_POLL_INTERVAL_S = 0.4
+METRIC_FALLBACK_S    = 5.0
+# FC03 metric reads are genuinely SLOW + variable on this sensor (~0.5-1 s,
+# occasionally more; FC04 raw reads on the same port are fast, so it's the
+# sensor's holding-register handler, not the wire). The vendor's Rust client
+# uses a 5 s read timeout for exactly this — and we MUST too, because a
+# premature timeout leaves the slow response in-flight; the next request then
+# reads that stale reply ("wrong byte count") and the stream desyncs forever.
+# So: generous timeout (don't bail on a slow-but-coming response) + a line
+# drain to resync if anything does go wrong. The timeout is swapped in only
+# around metric reads and restored to READ_TIMEOUT_S for raw streaming.
+#
+# Consequence: a full sweep of ~12 metrics costs a several-second floor. We
+# can't batch it away — the metric registers ALIAS (each base address is a
+# selector read with count=3; a block read returns garbage), which is why the
+# Rust reads each metric separately.
+METRIC_READ_TIMEOUT_S = 5.0
+METRIC_READ_RETRIES   = 3
+METRIC_READ_GAP_S     = 0.001
+
+
+class _MetricsAbort(Exception):
+    """Raised to bail out of an in-progress (slow) metric sweep when raw
+    streaming is requested or metrics are turned off — so a page switch to the
+    waveform view isn't blocked behind a multi-second FC03 batch."""
+
 
 def _emit_window(window_queue, port, window, max_qsize):
     # Drop-oldest on full so the inference worker always sees the freshest window.
@@ -68,6 +121,23 @@ def _emit_window(window_queue, port, window, max_qsize):
         except Exception:
             break
     window_queue.put((port, window))
+
+
+def _emit_raw_chunk(raw_queue, port, chunk):
+    """Push a small fresh-sample chunk to the waveform raw_queue. Drop-oldest
+    on full (best-effort, never blocks the read loop). qsize() may be
+    unimplemented on some platforms — tolerate that."""
+    if raw_queue is None:
+        return
+    try:
+        if raw_queue.full():
+            try:
+                raw_queue.get_nowait()
+            except Exception:
+                pass
+        raw_queue.put_nowait((port, chunk))
+    except Exception:
+        pass
 
 
 def _control_listener(recorder, req_q, resp_q, stop_event):
@@ -99,6 +169,7 @@ def _control_listener(recorder, req_q, resp_q, stop_event):
 
 def reader_process_main(port, window_queue, req_q, resp_q,
                         stop_event, active_event, data_dir,
+                        metrics_event=None, metrics_queue=None, raw_queue=None,
                         port_baud=3000000, bytesize=8, parity='N', stopbits=1,
                         timeout=READ_TIMEOUT_S, sample_rate=SAMPLE_RATE,
                         window_size=WINDOW_SIZE, hop_size=HOP_SIZE, max_qsize=12):
@@ -120,8 +191,8 @@ def reader_process_main(port, window_queue, req_q, resp_q,
     # the bundled-deps path before importing project modules.
     current_path = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_path, "site-packages"))
-    from fast_modbus import (read_input_registers, write_single_register,
-                              ModbusError)
+    from fast_modbus import (read_input_registers, read_holding_registers,
+                              write_single_register, ModbusError)
     from recorder import RecordingManager
 
     print(f"[{port}] reader subprocess started pid={os.getpid()} ppid={os.getppid()}")
@@ -178,6 +249,12 @@ def reader_process_main(port, window_queue, req_q, resp_q,
     total_fails = 0
     last_fail_logged_t = 0.0
 
+    # Waveform raw-chunk accumulator: collect decoded samples and emit a fresh
+    # chunk every RAW_CHUNK_SIZE (~36 Hz) to raw_queue, independent of the
+    # 2604-window inference emission below.
+    raw_accum = []
+    raw_accum_n = 0
+
     def safe_read(count):
         """Returns the registers list on success, or None on any failure
         (timeout, CRC, exception response). Tracks consecutive failures
@@ -214,16 +291,175 @@ def reader_process_main(port, window_queue, req_q, resp_q,
             time.sleep(1.0)
         fail_count = 0
 
+    def _drain():
+        """Read and discard until the line is quiet, then flush. Resyncs after
+        a slow/late response so a stale reply can't be mis-parsed as the next
+        request's response (the 'wrong byte count' desync)."""
+        old_to = client.timeout
+        client.timeout = 0.03
+        try:
+            while client.read(256):
+                pass
+        except Exception:
+            pass
+        finally:
+            client.timeout = old_to
+        try:
+            client.reset_input_buffer()
+        except Exception:
+            pass
+
+    def _abort_metrics():
+        """Raw streaming takes priority: bail out of metric reads the moment
+        raw is requested (page switch to waveform/inference, or a recording),
+        metrics are turned off, or we're shutting down. Metric reads share the
+        serial line with raw, so they must yield rather than block it."""
+        return (stop_event.is_set()
+                or active_event.is_set()
+                or (metrics_event is not None and not metrics_event.is_set()))
+
+    def _hold(addr, count):
+        """FC03 read with retries. Reads are slow + occasionally desync; on any
+        failure we drain the line before retrying so a stale late response
+        doesn't corrupt the next read. Bails via _MetricsAbort if raw streaming
+        is requested mid-sweep. Raises the last error if all attempts fail."""
+        last_err = None
+        for attempt in range(METRIC_READ_RETRIES):
+            if _abort_metrics():
+                raise _MetricsAbort()
+            if attempt:
+                _drain()
+            time.sleep(METRIC_READ_GAP_S)
+            try:
+                return read_holding_registers(client, 1, addr, count)
+            except (ModbusError, serial.SerialException, OSError) as e:
+                last_err = e
+        raise last_err
+
+    def _triple(addr, divisor):
+        """One FC03 read of 3 registers → [x, y, z] scaled. Mirrors the Rust
+        client: registers are read unsigned. NOTE skewness can be negative on
+        the wire — if it reads wrong, view as int16 here (flagged for the
+        hardware-validation pass)."""
+        regs = _hold(addr, 3)
+        return [regs[0] / divisor, regs[1] / divisor, regs[2] / divisor]
+
+    def read_metrics_batch():
+        """Full FC03 sweep of every computed metric → one snapshot dict.
+        Raises ModbusError on any failed read (caller skips the emit)."""
+        temp = _hold(REG_TEMPERATURE, 1)[0] / 100.0
+        g_freq = float(_hold(REG_GRAVITY_PRIM_FREQ, 1)[0])
+        v_freq = float(_hold(REG_VELOCITY_PRIM_FREQ, 1)[0])
+        return {
+            "ts": time.time(),
+            "temperature": temp,
+            "gravity": {
+                "rms":      _triple(REG_GRAVITY_RMS, 1000.0),
+                "peak":     _triple(REG_GRAVITY_PEAK, 1000.0),
+                "crest":    _triple(REG_GRAVITY_CREST, 1000.0),
+                "skewness": _triple(REG_GRAVITY_SKEWNESS, 1000.0),
+                "kurtosis": _triple(REG_GRAVITY_KURTOSIS, 1000.0),
+                "primary_freq": g_freq,
+            },
+            "velocity": {
+                "rms":   _triple(REG_VELOCITY_RMS, 100.0),
+                "peak":  _triple(REG_VELOCITY_PEAK, 100.0),
+                "crest": _triple(REG_VELOCITY_CREST, 100.0),
+                "primary_freq": v_freq,
+            },
+        }
+
+    # Metric polling state (used only when metrics_event is set).
+    metrics_were_on = False
+    last_kurt_regs = None       # raw kurtosis registers, for change detection
+    last_kurt_poll_t = 0.0
+    last_metric_emit_t = 0.0
+
+    def poll_metrics_step():
+        """Called once per loop iteration when metrics are active. Polls
+        kurtosis at KURT_POLL_INTERVAL_S; emits a full batch when it changes,
+        on the first poll, or after METRIC_FALLBACK_S of no change."""
+        nonlocal last_kurt_regs, last_kurt_poll_t, last_metric_emit_t
+        now = time.time()
+        if now - last_kurt_poll_t < KURT_POLL_INTERVAL_S:
+            return
+        last_kurt_poll_t = now
+        # FC03 metric reads are slow — give them a generous timeout, then
+        # restore the fast raw-read timeout no matter how we exit.
+        client.timeout = METRIC_READ_TIMEOUT_S
+        try:
+            _drain()    # start each poll cycle on a clean, synced line
+            try:
+                kurt = tuple(_hold(REG_GRAVITY_KURTOSIS, 3))
+            except _MetricsAbort:
+                return
+            except (ModbusError, serial.SerialException, OSError) as e:
+                print(f"[{port}] kurtosis poll failed: {e}")
+                return
+            changed = (kurt != last_kurt_regs)
+            fallback = (now - last_metric_emit_t >= METRIC_FALLBACK_S)
+            if not (changed or fallback):
+                return
+            try:
+                snap = read_metrics_batch()
+            except _MetricsAbort:
+                return    # raw took priority mid-sweep — drop this partial batch
+            except (ModbusError, serial.SerialException, OSError) as e:
+                print(f"[{port}] metrics batch failed: {e}")
+                return
+            last_kurt_regs = kurt
+            last_metric_emit_t = now
+            if metrics_queue is not None:
+                try:
+                    metrics_queue.put_nowait((port, snap))
+                except Exception:
+                    pass    # full / closed — drop, next emit replaces it anyway
+        finally:
+            client.timeout = timeout
+
     was_active = False
     while not stop_event.is_set():
-        if not active_event.is_set():
+        raw_on = active_event.is_set()
+        met_on = metrics_event.is_set() if metrics_event is not None else False
+
+        if not raw_on and not met_on:
             if was_active:
                 print(f"[{port}] deactivated — reader paused")
                 was_active = False
                 fill = 0
-            # Block on the event so we wake up the instant the main process
-            # activates us, instead of spinning every 50 ms.
+                raw_accum = []; raw_accum_n = 0
+            if metrics_were_on:
+                metrics_were_on = False
+                last_kurt_regs = None
+            # Block on the raw event so we wake the instant the main process
+            # activates us. (Metrics activation is caught on the next tick;
+            # 0.5 s latency to first metric is fine.)
             active_event.wait(timeout=0.5)
+            continue
+
+        # Metrics activation transition — force a fresh first emit.
+        if met_on and not metrics_were_on:
+            print(f"[{port}] metrics polling active")
+            metrics_were_on = True
+            last_kurt_regs = None
+            last_metric_emit_t = 0.0
+            last_kurt_poll_t = 0.0
+        elif not met_on and metrics_were_on:
+            metrics_were_on = False
+
+        # Poll metrics FIRST so the raw block's early-`continue`s below can't
+        # starve it. poll_metrics_step() self-gates on KURT_POLL_INTERVAL_S.
+        if met_on:
+            poll_metrics_step()
+
+        if not raw_on:
+            # Metrics-only mode: no FC04 streaming. Sleep so we don't busy-spin
+            # between kurtosis polls.
+            if was_active:
+                was_active = False
+                fill = 0
+                raw_accum = []; raw_accum_n = 0
+            time.sleep(0.05)
             continue
 
         if not was_active:
@@ -277,6 +513,17 @@ def reader_process_main(port, window_queue, req_q, resp_q,
         # as a separate small array so the recorder's stage-1 chunk list can
         # hold the reference safely while we compact the ring buffer below.
         recorder.feed(port, samples)
+
+        # Waveform tap (fast cadence): accumulate fresh samples and emit a
+        # small chunk every RAW_CHUNK_SIZE to the waveform ring buffer.
+        if raw_queue is not None:
+            raw_accum.append(samples)
+            raw_accum_n += samples.shape[0]
+            if raw_accum_n >= RAW_CHUNK_SIZE:
+                chunk = np.concatenate(raw_accum, axis=0)
+                _emit_raw_chunk(raw_queue, port, chunk)
+                raw_accum = []
+                raw_accum_n = 0
 
         # Slice-assign into the pre-allocated buffer instead of np.row_stack —
         # no allocation, no full-buffer memcpy per iteration.

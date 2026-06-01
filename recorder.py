@@ -81,6 +81,34 @@ def list_existing_labels(data_dir: str = DATA_DIR):
     return [by_name[n] for n in sorted(by_name)]
 
 
+def delete_label(data_dir: str, name: str):
+    """Delete the recording files for `name` (both .bin and legacy .csv twin).
+    `name` must match what `list_existing_labels` returns — we DO NOT re-sanitize
+    it (that would mangle e.g. leading underscores). Instead we reject path
+    separators and confirm the resolved path lives directly in data_dir.
+    Returns the list of removed filenames. Raises ValueError on an invalid
+    name or if nothing exists."""
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or "\x00" in name or name in (".", ".."):
+        raise ValueError("invalid name")
+    data_dir_abs = os.path.abspath(data_dir)
+    removed = []
+    for ext in (".bin", ".csv"):
+        path = os.path.abspath(os.path.join(data_dir, f"{name}{ext}"))
+        # Guard against traversal: the file must sit directly in data_dir.
+        if os.path.dirname(path) != data_dir_abs:
+            raise ValueError("invalid name")
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed.append(os.path.basename(path))
+            except OSError as e:
+                raise ValueError(f"could not delete {os.path.basename(path)}: {e}")
+    if not removed:
+        raise ValueError(f"no recording named {name!r}")
+    return removed
+
+
 class RecordingSession:
     def __init__(self, name, port, target_samples, mode, file_path):
         self.name = name

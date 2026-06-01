@@ -37,7 +37,7 @@ from state import RollingPredictions, SnapshotBus, ROLLING_WINDOW
 from sensor_reader import (reader_process_main, ALLOWED_PORTS,
                            get_existed_serial_ports, SAMPLE_RATE)
 from inference import InferenceWorker
-from recorder import list_existing_labels, MIN_SAMPLES, DATA_DIR
+from recorder import list_existing_labels, delete_label, MIN_SAMPLES, DATA_DIR
 from trainer import TrainerManager, MIN_WINDOWS, WINDOW_SIZE
 from classifier import DEFAULT_HEAD_PATH
 from waveform import WaveformAggregator, WaveformBus
@@ -175,32 +175,92 @@ def build_app():
     # before put() would block; drop-oldest on the writer side kicks in
     # well before we hit the maxsize cap.
     window_queue = mp.Queue(maxsize=16)
+    # Metrics are emitted only every ~2-5 s per port, so a small cap is plenty;
+    # the reader drops-oldest on its side if it ever backs up.
+    metrics_queue = mp.Queue(maxsize=16)
+    # Fast raw-sample chunks (~217 samples ≈ 36 Hz/port) for the waveform ring.
+    raw_queue = mp.Queue(maxsize=64)
     bus = SnapshotBus()
     waveform_bus = WaveformBus()
+    metrics_bus = SnapshotBus()            # generic monotonic-seq bus, reused
     rolling_predictions = {p: RollingPredictions(on_latch=bus.bump) for p in ports}
-    waveform_agg = WaveformAggregator(ports, on_publish=waveform_bus.bump)
+    waveform_agg = WaveformAggregator(ports)
+
+    # Latest computed-metric snapshot per port (filled by the drain thread).
+    metrics_latest = {p: None for p in ports}
+    metrics_latest_lock = threading.Lock()
 
     # Per-port reader subprocess + RPC channel for the recorder it owns.
     req_qs   = {p: mp.Queue() for p in ports}
     resp_qs  = {p: mp.Queue() for p in ports}
     stop_events = {p: mp.Event() for p in ports}
-    # active_events start CLEAR — every reader is paused on boot. The UI
-    # (or /api/record/start) flips exactly one event at a time so only one
-    # sensor is ever pulling Modbus traffic; switching ports resets the
-    # paused port's FIFO via a sample-rate rewrite inside the subprocess.
-    active_events = {p: mp.Event() for p in ports}
+    # active_events gate FC04 raw streaming; metrics_events gate FC03 metric
+    # polling. Both start CLEAR — every reader is fully idle on boot. The two
+    # are independent so the /metrics page can poll metrics without paying the
+    # 3 Mbps raw-stream cost, and vice-versa.
+    active_events  = {p: mp.Event() for p in ports}
+    metrics_events = {p: mp.Event() for p in ports}
     reader_procs = {}
     for p in ports:
         proc = mp.Process(
             target=reader_process_main,
             args=(p, window_queue, req_qs[p], resp_qs[p],
-                  stop_events[p], active_events[p], data_dir),
+                  stop_events[p], active_events[p], data_dir,
+                  metrics_events[p], metrics_queue, raw_queue),
             daemon=True,
             name=f"reader-{p.replace('/', '_')}",
         )
         proc.start()
         reader_procs[p] = proc
         print(f"[app] spawned reader process for {p} (pid={proc.pid})")
+
+    # Drain thread: pull metric snapshots off the cross-process queue, store
+    # the latest per port, and wake any /api/metrics_stream SSE clients.
+    def metrics_drain_loop():
+        while True:
+            try:
+                port, snap = metrics_queue.get(timeout=1.0)
+            except Exception:
+                continue
+            with metrics_latest_lock:
+                metrics_latest[port] = snap
+            metrics_bus.bump()
+
+    threading.Thread(target=metrics_drain_loop, daemon=True,
+                     name="metrics-drain").start()
+
+    # Raw-sample drain: feed fresh chunks into the waveform ring buffer. Cheap
+    # (memcpy) so it keeps up with ~144 chunks/sec (4 ports × 36 Hz).
+    def raw_drain_loop():
+        while True:
+            try:
+                port, chunk = raw_queue.get(timeout=1.0)
+            except Exception:
+                continue
+            waveform_agg.append(port, chunk)
+
+    threading.Thread(target=raw_drain_loop, daemon=True, name="raw-drain").start()
+
+    # Display tick: recompute waveform snapshots from the rings at a steady
+    # rate and wake SSE clients. Decouples the SSE push cadence from the
+    # 144 Hz append rate; FFT self-throttles to ~6 Hz inside render_tick().
+    WAVEFORM_TICK_HZ = 30
+
+    def waveform_tick_loop():
+        period = 1.0 / WAVEFORM_TICK_HZ
+        while True:
+            t0 = time.monotonic()
+            try:
+                if waveform_agg.render_tick():
+                    waveform_bus.bump()
+            except Exception as e:
+                print(f"[app] waveform tick error: {e}")
+            dt = time.monotonic() - t0
+            if dt < period:
+                time.sleep(period - dt)
+
+    threading.Thread(target=waveform_tick_loop, daemon=True,
+                     name="waveform-tick").start()
 
     # No CPU pinning for the main process either — the kernel schedules
     # Flask + InferenceWorker alongside the reader subprocesses freely.
@@ -227,14 +287,37 @@ def build_app():
     active_state_lock = threading.Lock()
     inference_open = set()      # ports the user opened for live inference
     recording_ports = set()     # ports held awake purely for an active recording
+    metrics_open = set()        # ports the user opened on the /metrics page
 
     def _sync_reader_locked(port):
-        """Reconcile the reader gate from the two reasons it might run.
-        Caller must hold active_state_lock."""
+        """Reconcile the two reader gates from the reasons they might run.
+        Caller must hold active_state_lock. Raw streaming (active_event) runs
+        for inference or recording; metric polling (metrics_event) runs for
+        the /metrics page — independently."""
         if port in inference_open or port in recording_ports:
             active_events[port].set()
         else:
             active_events[port].clear()
+        if port in metrics_open:
+            metrics_events[port].set()
+        else:
+            metrics_events[port].clear()
+
+    def open_metrics(port):
+        """User opened this port on the /metrics page."""
+        if port not in ports:
+            raise ValueError(f"unknown port: {port!r}")
+        with active_state_lock:
+            metrics_open.add(port)
+            _sync_reader_locked(port)
+
+    def close_metrics(port):
+        """User left the /metrics page (or unchecked this port)."""
+        if port not in ports:
+            raise ValueError(f"unknown port: {port!r}")
+        with active_state_lock:
+            metrics_open.discard(port)
+            _sync_reader_locked(port)
 
     def open_inference(port):
         """User opened this port for live inference. Clears the rolling buffer
@@ -282,11 +365,21 @@ def build_app():
                 end_recording(port)
 
     inferer = InferenceWorker(window_queue, rolling_predictions,
-                              head_path=head_path,
-                              waveform_aggregator=waveform_agg)
+                              head_path=head_path)
     inferer.start()
 
     trainer = TrainerManager(data_dir=data_dir, head_path=head_path)
+
+    def metrics_payload():
+        with metrics_latest_lock:
+            ports_out = {p: metrics_latest.get(p) for p in ports}
+        with active_state_lock:
+            open_ports = [p for p in ports if p in metrics_open]
+        return {
+            "ports": ports_out,
+            "open_ports": open_ports,
+            "now": time.time(),
+        }
 
     def snapshot_payload():
         now = time.time()
@@ -350,7 +443,8 @@ def build_app():
                                sample_rate=SAMPLE_RATE,
                                display_points=waveform_agg.display_points,
                                window_size=waveform_agg.window_size,
-                               raw_samples=waveform_agg.raw_samples)
+                               raw_samples=waveform_agg.raw_samples,
+                               raw_max_samples=waveform_agg.raw_max_samples)
 
     @app.route("/inference")
     def inference_dashboard():
@@ -360,6 +454,47 @@ def build_app():
                                active_page="live",
                                class_labels=labels,
                                rolling_window=ROLLING_WINDOW)
+
+    @app.route("/metrics")
+    def metrics_page():
+        return render_template("metrics.html", active_page="metrics")
+
+    @app.route("/api/metrics_active", methods=["POST"])
+    def api_set_metrics_active():
+        """Open/close FC03 metric polling for one port. Body:
+        {port, active}. The /metrics page opens every port on load and
+        closes them on unload."""
+        body = request.get_json(silent=True) or {}
+        port = body.get("port")
+        active = bool(body.get("active"))
+        try:
+            if active:
+                open_metrics(port)
+            else:
+                close_metrics(port)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"port": port, "active": active})
+
+    @app.route("/api/metrics_stream")
+    def metrics_stream():
+        """SSE pushing the latest per-port metric snapshots. Driven by the
+        drain thread's bus bump — i.e. at the slow kurtosis cadence."""
+        def gen():
+            last_seq = metrics_bus.current_seq()
+            yield f"data: {json.dumps(metrics_payload())}\n\n"
+            while True:
+                new_seq = metrics_bus.wait_for_change(last_seq, timeout=SSE_HEARTBEAT_S)
+                if new_seq > last_seq:
+                    last_seq = new_seq
+                    yield f"data: {json.dumps(metrics_payload())}\n\n"
+                else:
+                    yield ": heartbeat\n\n"
+
+        return Response(gen(), mimetype="text/event-stream", headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
 
     @app.route("/api/waveform_config", methods=["POST"])
     def waveform_config():
@@ -473,6 +608,27 @@ def build_app():
             "window_size": WINDOW_SIZE,
             "data_dir": data_dir,
         })
+
+    @app.route("/api/recordings/delete", methods=["POST"])
+    def recordings_delete():
+        body = request.get_json(silent=True) or {}
+        name = body.get("name", "")
+        # Don't delete a label that's currently being recorded.
+        with record_state_lock:
+            active_port = record_state["port"]
+        if active_port is not None:
+            rec = recorders.get(active_port)
+            try:
+                session = rec.status() if rec is not None else None
+            except RuntimeError:
+                session = None
+            if session and session.get("status") == "active" and session.get("name") == name:
+                return jsonify({"error": "recording in progress for this label"}), 409
+        try:
+            removed = delete_label(data_dir, name)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"deleted": removed})
 
     @app.route("/api/record/start", methods=["POST"])
     def record_start():

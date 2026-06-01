@@ -1,5 +1,5 @@
-"""Minimal Modbus RTU client — FC04 (read input registers) and FC06
-(write single register) only, directly over pyserial.
+"""Minimal Modbus RTU client — FC03 (read holding registers), FC04 (read
+input registers) and FC06 (write single register), directly over pyserial.
 
 Replaces pymodbus on the hot read path. pymodbus is general-purpose
 (framers, codecs, transports, retries, server support); for our use
@@ -79,6 +79,47 @@ def read_input_registers(ser, slave_id: int, address: int, count: int):
     # Decode N big-endian uint16s in one struct.unpack call (faster than a
     # Python-level loop, and avoids creating a numpy array we'd just discard
     # — sensor_reader does its own typed conversion straight from this list).
+    return list(struct.unpack(f'>{count}H', resp[3:3 + 2 * count]))
+
+
+def read_holding_registers(ser, slave_id: int, address: int, count: int):
+    """FC03 — read `count` holding registers starting at `address`.
+    Returns a list of int (each register decoded as big-endian uint16).
+    Raises ModbusError on any wire-level problem.
+
+    Used for the computed metrics (temperature, RMS/peak/crest/skew/kurt,
+    velocity) which the sensor exposes as holding registers, unlike the raw
+    XYZ FIFO which is an input register (FC04)."""
+    req = struct.pack('>BBHH', slave_id, 0x03, address, count)
+    req += struct.pack('<H', _crc16(req))
+
+    ser.reset_input_buffer()
+    ser.write(req)
+
+    expected_len = 5 + 2 * count
+    resp = ser.read(expected_len)
+    if len(resp) != expected_len:
+        raise ModbusError(
+            f"short read: got {len(resp)} of {expected_len} bytes "
+            f"(slave={slave_id}, addr=0x{address:04x}, count={count})"
+        )
+
+    if resp[0] != slave_id:
+        raise ModbusError(f"wrong slave_id: got {resp[0]}, expected {slave_id}")
+    if resp[1] & 0x80:
+        raise ModbusError(f"modbus exception code 0x{resp[2]:02x}")
+    if resp[1] != 0x03:
+        raise ModbusError(f"wrong func: got 0x{resp[1]:02x}, expected 0x03")
+    if resp[2] != 2 * count:
+        raise ModbusError(f"wrong byte count: got {resp[2]}, expected {2 * count}")
+
+    expected_crc = _crc16(resp[:-2])
+    actual_crc = resp[-1] << 8 | resp[-2]
+    if expected_crc != actual_crc:
+        raise ModbusError(
+            f"CRC mismatch: got 0x{actual_crc:04x}, expected 0x{expected_crc:04x}"
+        )
+
     return list(struct.unpack(f'>{count}H', resp[3:3 + 2 * count]))
 
 

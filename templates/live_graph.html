@@ -45,7 +45,7 @@
 
   .waveform-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(1, minmax(0, 1fr));
     grid-auto-rows: minmax(0, 1fr);
     gap: 16px;
   }
@@ -56,7 +56,7 @@
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    box-shadow: 0 1px 2px hsl(240 5% 10% / 0.04);
+    box-shadow: var(--shadow-sm);
     padding: 12px 12px 4px;
   }
   .waveform-card header {
@@ -75,6 +75,7 @@
     font-size: 11px;
     color: var(--muted-foreground);
     font-variant-numeric: tabular-nums;
+    font-family: var(--font-mono);
   }
   .waveform-stats {
     display: grid;
@@ -105,10 +106,11 @@
     color: var(--muted-foreground);
     overflow: hidden;
     text-overflow: ellipsis;
+    font-family: var(--font-mono);
   }
-  .waveform-stats .chip.axis-x { border-left-color: hsl(0 72% 51%); }
-  .waveform-stats .chip.axis-y { border-left-color: hsl(142 71% 45%); }
-  .waveform-stats .chip.axis-z { border-left-color: hsl(217 91% 60%); }
+  .waveform-stats .chip.axis-x { border-left-color: var(--axis-x); }
+  .waveform-stats .chip.axis-y { border-left-color: var(--axis-y); }
+  .waveform-stats .chip.axis-z { border-left-color: var(--axis-z); }
   .waveform-stats .chip {
     cursor: pointer;
     user-select: none;
@@ -126,7 +128,8 @@
     padding: 6px 8px;
     font-size: 11px;
     font-variant-numeric: tabular-nums;
-    box-shadow: 0 2px 8px hsl(240 5% 10% / 0.12);
+    font-family: var(--font-mono);
+    box-shadow: var(--shadow-md);
     z-index: 5;
     white-space: nowrap;
     transform: translate(8px, 8px);
@@ -140,17 +143,17 @@
   }
   .uplot-tooltip .tt-row { display: flex; gap: 8px; line-height: 1.5; }
   .uplot-tooltip .tt-row .tt-name { font-weight: 700; }
-  .uplot-tooltip .tt-row.row-x .tt-name { color: hsl(0 72% 51%); }
-  .uplot-tooltip .tt-row.row-y .tt-name { color: hsl(142 71% 45%); }
-  .uplot-tooltip .tt-row.row-z .tt-name { color: hsl(217 91% 60%); }
+  .uplot-tooltip .tt-row.row-x .tt-name { color: var(--axis-x); }
+  .uplot-tooltip .tt-row.row-y .tt-name { color: var(--axis-y); }
+  .uplot-tooltip .tt-row.row-z .tt-name { color: var(--axis-z); }
 
   .waveform-plot {
     width: 100%;
     height: 280px;
   }
   /* uPlot tweaks — match the existing design tokens */
-  .uplot, .u-wrap { font-family: 'Inter', sans-serif; }
-  .u-axis { color: hsl(240 3.8% 46.1%); }
+  .uplot, .u-wrap { font-family: var(--font-sans); }
+  .u-axis { color: var(--muted-foreground); }
   .u-legend { display: none; }
 </style>
 {% endblock %}
@@ -177,13 +180,18 @@
   </label>
   <label id="ctl-raw" class="toolbar-meta" style="display:flex; align-items:center; gap:6px;">
     <span>Latest</span>
-    <input id="raw-range" class="select" type="number" min="32" max="{{ window_size }}" step="50"
+    <input id="raw-range" class="select" type="number" min="32" max="{{ raw_max_samples }}" step="50"
            value="{{ raw_samples }}" style="width:90px; padding:6px 8px;">
     <span>samples</span>
   </label>
-  <div class="toolbar-meta">
-    {{ display_points }} pts/trace · {{ sample_rate }} Hz
-  </div>
+  <label id="ctl-refresh" class="toolbar-meta" style="display:flex; align-items:center; gap:6px;">
+    <span>Refresh</span>
+    <select id="refresh-rate" class="select" style="width:auto; padding:6px 8px;">
+      <option value="10">10 fps</option>
+      <option value="30" selected>30 fps</option>
+      <option value="60">60 fps</option>
+    </select>
+  </label>
 </div>
 
 <div id="waveform-grid" class="waveform-grid">
@@ -213,11 +221,19 @@ import { setIfChanged } from "{{ url_for('static', filename='app.js') }}";
 // Ports come from the server template. The SSE payload tags each port; we
 // match by port string.
 const PORTS = {{ ports|tojson }};
-const AXIS_COLORS = {
-  x: "hsl(0 72% 51%)",
-  y: "hsl(142 71% 45%)",
-  z: "hsl(217 91% 60%)",
+// Pull palette/colours straight from the shadcn CSS tokens so the canvas
+// plots match the rest of the UI (single source of truth in styles.css).
+const cssVar = (name, fallback) => {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
 };
+const AXIS_COLORS = {
+  x: cssVar("--axis-x", "hsl(0 72% 51%)"),
+  y: cssVar("--axis-y", "hsl(142 71% 45%)"),
+  z: cssVar("--axis-z", "hsl(217 91% 60%)"),
+};
+const GRID_COLOR   = cssVar("--border", "hsl(240 5.9% 90%)");
+const TEXT_COLOR   = cssVar("--muted-foreground", "hsl(240 3.8% 46.1%)");
 const PLOT_HEIGHT = 280;
 
 // uPlot draws axis labels on <canvas>, so i18n.js's DOM walker can't reach
@@ -226,6 +242,8 @@ const PLOT_HEIGHT = 280;
 const tr = (s) => (window.t ? window.t(s) : s);
 
 let mode = "raw";          // "raw" | "fft"
+let renderFps = 30;        // user-selectable client render cap (10/30/60)
+let lastRenderT = 0;
 const lastRawSeq = new Map();
 const lastFftSeq = new Map();
 const uPlots    = new Map();      // port -> uPlot instance
@@ -238,6 +256,7 @@ let rawAxis = null;        // "samples ago" ascending (0 = latest)
 let freqAxis = null;
 let lastSnapshot = null;
 const WINDOW_SIZE = {{ window_size }};
+const RAW_MAX = {{ raw_max_samples }};   // ring-backed: up to ~1 s
 
 // ── activation ───────────────────────────────────────────────────────
 function activateAll(active) {
@@ -277,7 +296,10 @@ function buildOpts(width, port) {
     if (!tt) return;
     const idx = u.cursor.idx;
     if (idx == null || u.cursor.left < 0) { tt.style.display = "none"; return; }
-    const xVal = u.data[0][idx];
+    const xVal = u.data[0] ? u.data[0][idx] : null;
+    // idx can momentarily point past the data during a redraw (e.g. when a
+    // series is toggled) — bail rather than throw.
+    if (xVal == null) { tt.style.display = "none"; return; }
     const fmtY = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(3);
     tt.innerHTML =
       `<div class="tt-x">${xLine(xVal)}</div>` +
@@ -312,18 +334,18 @@ function buildOpts(width, port) {
         labelSize: 22,
         labelGap: 4,
         size: 36,
-        stroke: "hsl(240 3.8% 46.1%)",
-        grid: { stroke: "hsl(240 5.9% 90%)", width: 1 },
-        ticks: { stroke: "hsl(240 5.9% 90%)" },
+        stroke: TEXT_COLOR,
+        grid: { stroke: GRID_COLOR, width: 1 },
+        ticks: { stroke: GRID_COLOR },
       },
       {
         label: isFft ? tr("Magnitude") : tr("Acceleration (G)"),
         labelSize: 22,
         labelGap: 4,
         size: 50,
-        stroke: "hsl(240 3.8% 46.1%)",
-        grid: { stroke: "hsl(240 5.9% 90%)", width: 1 },
-        ticks: { stroke: "hsl(240 5.9% 90%)" },
+        stroke: TEXT_COLOR,
+        grid: { stroke: GRID_COLOR, width: 1 },
+        ticks: { stroke: GRID_COLOR },
       },
     ],
     series: [
@@ -433,9 +455,15 @@ function refreshChipDimming(port) {
 function toggleAxis(port, ax) {
   const show = getAxisShow(port);
   show[ax] = !show[ax];
-  const u = uPlots.get(port);
-  if (u) u.setSeries(SERIES_IDX[ax], { show: show[ax] });
+  // Dim the chip FIRST — it's pure DOM and must always stay in sync with the
+  // show state. Doing it before setSeries means a uPlot redraw error (or its
+  // cursor hook throwing) can't leave the chip un-dimmed while the line hides.
   refreshChipDimming(port);
+  const u = uPlots.get(port);
+  if (u) {
+    try { u.setSeries(SERIES_IDX[ax], { show: show[ax] }); }
+    catch (e) { console.warn("setSeries failed:", e); }
+  }
 }
 
 // ── stats ────────────────────────────────────────────────────────────
@@ -525,8 +553,11 @@ function renderPort(port, entry) {
 function syncRangeControls() {
   const fftCtl = document.getElementById("ctl-fft");
   const rawCtl = document.getElementById("ctl-raw");
+  const refreshCtl = document.getElementById("ctl-refresh");
   if (fftCtl) fftCtl.style.display = (mode === "fft") ? "flex" : "none";
   if (rawCtl) rawCtl.style.display = (mode === "raw") ? "flex" : "none";
+  // Refresh fps only governs the raw scroll — hide it in FFT mode.
+  if (refreshCtl) refreshCtl.style.display = (mode === "raw") ? "flex" : "none";
 }
 
 function setMode(next) {
@@ -556,6 +587,13 @@ function handleSnapshot(data) {
   lastSnapshot = data;
   if (data.raw_axis) rawAxis = data.raw_axis;
   if (data.freq_axis_hz) freqAxis = data.freq_axis_hz;
+
+  // Refresh-rate throttle: the server pushes at ~30 Hz; honor the user's
+  // chosen fps by skipping the (expensive) re-render of faster pushes.
+  // lastSnapshot is still updated above so a mode toggle uses fresh data.
+  const nowT = performance.now();
+  if (nowT - lastRenderT < (1000 / renderFps)) return;
+  lastRenderT = nowT;
 
   let anyChanged = false;
   const isFft = mode === "fft";
@@ -629,20 +667,31 @@ function applyFftRange(hz, persist) {
 }
 
 function applyRawSamples(n, persist) {
-  n = clamp(Math.round(Number(n) || 0), 32, WINDOW_SIZE);
+  n = clamp(Math.round(Number(n) || 0), 32, RAW_MAX);
   if (rawRangeEl) rawRangeEl.value = String(n);
   postConfig({ raw_samples: n });
   if (persist) { const p = loadPrefs(); p.rawSamples = n; savePrefs(p); }
 }
 
+function applyRefreshFps(fps, persist) {
+  fps = clamp(Math.round(Number(fps) || 30), 1, 60);
+  renderFps = fps;
+  if (refreshEl) refreshEl.value = String(fps);
+  if (persist) { const p = loadPrefs(); p.refreshFps = fps; savePrefs(p); }
+}
+
+const refreshEl = document.getElementById("refresh-rate");
+
 if (fftRangeEl) fftRangeEl.addEventListener("change", () => applyFftRange(fftRangeEl.value, true));
 if (rawRangeEl) rawRangeEl.addEventListener("change", () => applyRawSamples(rawRangeEl.value, true));
+if (refreshEl) refreshEl.addEventListener("change", () => applyRefreshFps(refreshEl.value, true));
 
 // Restore persisted choices and push them to the server on load.
 {
   const p = loadPrefs();
   if (p.fftMaxHz != null) applyFftRange(p.fftMaxHz, false);
   if (p.rawSamples != null) applyRawSamples(p.rawSamples, false);
+  applyRefreshFps(p.refreshFps != null ? p.refreshFps : 30, false);
 }
 
 // Language toggle re-applies DOM translations via i18n.js, but the uPlot

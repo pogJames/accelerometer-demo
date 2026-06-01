@@ -22,32 +22,19 @@
   .alias-table tr:last-child td { border-bottom: 0; }
   .port-path {
     font-variant-numeric: tabular-nums;
-    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
     color: var(--muted-foreground);
   }
-  .alias-input {
-    width: 100%;
-    max-width: 320px;
-    padding: 6px 10px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--background);
-    color: var(--foreground);
-    font: inherit;
-    font-size: 13px;
-  }
-  .alias-input:focus {
-    outline: 2px solid var(--ring);
-    outline-offset: -1px;
-  }
+  /* Width-only modifier; the shared .input class provides the shadcn styling. */
+  .alias-input { width: 100%; max-width: 320px; }
   .alias-status {
     font-size: 11px;
     color: var(--muted-foreground);
     margin-left: 12px;
     font-variant-numeric: tabular-nums;
   }
-  .alias-status.saved { color: hsl(142 71% 35%); }
+  .alias-status.saved { color: var(--axis-y); }   /* green from the palette */
   .alias-status.error { color: var(--destructive); }
 </style>
 {% endblock %}
@@ -78,7 +65,7 @@
         <tr>
           <td><span class="port-path">{{ p }}</span></td>
           <td>
-            <input class="alias-input" data-port="{{ p }}" type="text"
+            <input class="input alias-input" data-port="{{ p }}" type="text"
                    value="{{ aliases.get(p, '') }}"
                    placeholder="(default: {{ p }})">
             <span class="alias-status" data-status-for="{{ p }}"></span>

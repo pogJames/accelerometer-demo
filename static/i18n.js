@@ -9,7 +9,19 @@
     'Live inference': '即時推論',
     'Data recording': '資料錄製',
     'Train model': '訓練模型',
+    'Metrics data': '指標數據',
     'Settings': '設定',
+
+    // Metrics page
+    'Temperature': '溫度',
+    'Gravity (G)': '重力 (G)',
+    'Velocity (mm/s)': '速度 (mm/s)',
+    'RMS': '均方根',
+    'Peak': '峰值',
+    'Crest': '波峰因數',
+    'Skewness': '偏度',
+    'Kurtosis': '峰度',
+    'Primary frequency': '主頻率',
     'inference': '推論',
     'sensors': '感測器',
 
@@ -31,6 +43,7 @@
     'Magnitude': '幅值',
     'to': '到',
     'FFT range': 'FFT 範圍',
+    'Refresh': '更新率',
     'Latest Samples': '最近樣本數',
     'Latest': '最近',
     'samples': '樣本',

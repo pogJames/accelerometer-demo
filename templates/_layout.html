@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 <script>
   // Pre-paint <html lang> so :lang() selectors apply before i18n.js runs.
@@ -34,6 +34,16 @@
           <path d="M3 12h3l3-7 4 14 3-7h5"/>
         </svg>
         <span>Live waveform</span>
+      </a>
+      <a class="nav-item {% if active_page == 'metrics' %}active{% endif %}" href="{{ url_for('metrics_page') }}">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v18h18"/>
+          <rect x="7" y="11" width="3" height="6"/>
+          <rect x="12" y="7" width="3" height="10"/>
+          <rect x="17" y="13" width="3" height="4"/>
+        </svg>
+        <span>Metrics data</span>
       </a>
       <a class="nav-item {% if active_page == 'record' %}active{% endif %}" href="{{ url_for('record_page') }}">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
