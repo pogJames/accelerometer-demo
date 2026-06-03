@@ -1,0 +1,81 @@
+# .github/workflows/ci.yml
+#
+# CI pipeline for npu-demo
+# Runs on every push and pull request to master.
+#
+# Jobs:
+#   lint     — flake8 style check across all .py files
+#   smoketest — install deps, run inference_smoketest.py in CPU mode
+#
+# The NPU delegate (libteflon.so) is hardware-only and will never exist
+# on a GitHub runner. FORCE_CPU=1 tells the smoketest to skip the NPU
+# path and run the backbone on the CPU via ai_edge_litert instead.
+# This still catches: broken imports, model file corruption, quantization
+# mismatches, and logic regressions in the inference path.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+
+  # ── 1. Lint ────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (flake8)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Run flake8
+        run: |
+          flake8 . \
+            --max-line-length=120 \
+            --exclude=.venv,__pycache__ \
+            --count \
+            --statistics
+
+  # ── 2. Smoketest ───────────────────────────────────────────────────────────
+  smoketest:
+    name: Inference smoketest (CPU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: |
+          pip install \
+            Flask==3.1.3 \
+            numpy==2.4.4 \
+            pandas==3.0.2 \
+            pyserial==3.5 \
+            ai-edge-litert==2.1.4
+
+      # pyfftw requires libfftw3 native libs — skip it here.
+      # It is only used for waveform display, not inference.
+
+      - name: Run inference smoketest (CPU mode)
+        env:
+          FORCE_CPU: "1"
+        run: python inference_smoketest.py --runs 50
