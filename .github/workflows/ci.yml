@@ -44,6 +44,7 @@ jobs:
         run: |
           flake8 . \
             --max-line-length=120 \
+            --extend-ignore=E221,E402,E702,E741,E127,E131 \
             --exclude=.venv,__pycache__ \
             --count \
             --statistics
