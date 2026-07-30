@@ -1,4 +1,4 @@
-# npu-classifier
+# accel-demo
 
 Real-time vibration monitor + classifier. A tri-axial accelerometer streams raw XYZ samples over Modbus RTU → a frozen CNN backbone extracts 128-d embeddings → a cosine-similarity head classifies motion → live waveform, FFT spectrum, sensor metrics and inference results all surface in a Flask dashboard. No retraining the backbone; the head is computed in seconds from your own recordings.
 
