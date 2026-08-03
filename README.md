@@ -1,9 +1,13 @@
 # accelerometer-demo
 
+**English** · [繁體中文](README.zh-TW.md)
+
 Real-time vibration monitor and motion classifier for the **Matrix800** gateway.
 A tri-axial accelerometer streams raw XYZ over Modbus RTU → a frozen CNN backbone
 runs on the NPU → a cosine-similarity head labels the motion → a live Flask
 dashboard shows the waveform, FFT, sensor metrics, and class.
+
+**See actual interface**: [api.md → page details](docs/api.md#page-details).
 
 <p float="left">
     <img src="docs/SETUP.jpeg" alt="SIM" width="50%">

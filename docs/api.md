@@ -1,5 +1,7 @@
 # API
 
+**English** · [繁體中文](api.zh-TW.md)
+
 The HTTP surface for building on top of the demo: dashboard pages, SSE streams,
 and control endpoints.
 

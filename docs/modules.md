@@ -1,5 +1,7 @@
 # Modules
 
+**English** · [繁體中文](modules.zh-TW.md)
+
 Per-file design notes for anyone editing the internals. For the system view see
 [architecture.md](architecture.md).
 

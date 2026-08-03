@@ -1,5 +1,7 @@
 # Getting started
 
+**English** · [繁體中文](getting-started.zh-TW.md)
+
 How to run the demo on a **Matrix800** gateway.
 
 See also: [architecture.md](architecture.md) for how it works,

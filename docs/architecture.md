@@ -1,5 +1,7 @@
 # Architecture
 
+**English** · [繁體中文](architecture.zh-TW.md)
+
 How the system is put together and why. For per-file notes see
 [modules.md](modules.md); for the HTTP surface see [api.md](api.md).
 
