@@ -1,6 +1,6 @@
 """Lightweight CPU-side classifier head.
 
-The head pairs with a frozen feature-extractor backbone (`vibration_backbone*.tflite`):
+The head pairs with a frozen feature-extractor backbone (`models/vibration_backbone*.tflite`):
 the backbone turns a (WINDOW, 3) raw window into a 128-d float embedding; the head
 classifies that embedding by cosine similarity against per-class prototypes.
 

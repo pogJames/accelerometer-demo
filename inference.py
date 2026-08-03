@@ -2,9 +2,12 @@
 
 Each (WINDOW, 3) window → backbone → 128-d embedding → head.predict()
 → (class_id, similarity, class_name). Trained instantly from data/*.bin
-(or legacy *.csv) via trainer.py. Backbone variant `vibration_backbone_int8.tflite` is
-preferred for NPU; `vibration_backbone.tflite` (float32) is the CPU
-fallback — _classify() handles both via dtype-aware quant/dequant.
+(or legacy *.csv) via trainer.py.
+
+This build targets the NXP i.MX Ethos-U NPU (Vela-compiled int8 model through
+`tflite_runtime` + the Ethos-U delegate), and falls back to the float32 model
+on CPU. To run on a different NPU (e.g. Matrix800 / VeriSilicon), change the
+three PORT-marked spots below — see "Porting to another NPU" in README.md.
 "untrained" and "stub" states let the dashboard render before artifacts exist.
 """
 
@@ -16,21 +19,23 @@ import numpy as np
 from classifier import ClassifierHead, DEFAULT_HEAD_PATH
 
 
-INT8_BACKBONE_PATH    = "vibration_backbone_int8.tflite"
-FLOAT_BACKBONE_PATH   = "vibration_backbone.tflite"
-DEFAULT_DELEGATE_PATH = "/usr/local/lib/aarch64-linux-gnu/libteflon.so"
+# ── Backend paths (NXP i.MX / Ethos-U) ────────────────────────────────────
+# PORT: to target another NPU, change DELEGATE_PATH + NPU_MODEL_PATH here and
+# the runtime import inside _try_load_interpreter(). README "Porting to another NPU".
+NPU_MODEL_PATH = "models/vibration_backbone_int8_vela.tflite"  # Vela-compiled int8, Ethos-U only
+CPU_MODEL_PATH = "models/vibration_backbone.tflite"            # float32, CPU fallback / FORCE_CPU=1
+DELEGATE_PATH  = "/usr/lib/libethosu_delegate.so"             # PORT: Ethos-U delegate
 
 
 def _resolve_default_model_path():
-    if os.path.exists(INT8_BACKBONE_PATH):
-        return INT8_BACKBONE_PATH
-    return FLOAT_BACKBONE_PATH
+    """Best-guess for early display; the real one is set when a backend loads."""
+    return NPU_MODEL_PATH if os.path.exists(NPU_MODEL_PATH) else CPU_MODEL_PATH
 
 
 class InferenceWorker(threading.Thread):
     def __init__(self, window_queue, rolling_predictions,
                  model_path=None,
-                 delegate_path=DEFAULT_DELEGATE_PATH,
+                 delegate_path=DELEGATE_PATH,
                  head_path=DEFAULT_HEAD_PATH):
         super().__init__(daemon=True)
         self.window_queue = window_queue
@@ -61,44 +66,57 @@ class InferenceWorker(threading.Thread):
         return self._stopper.is_set()
 
     def _try_load_interpreter(self):
-        """Try NPU → CPU → stub. Sets self.mode/_interp/_inp/_out on success.
+        """Load the Ethos-U NPU backend, falling back to CPU then stub.
+        Sets self.mode/_interp/_inp/_out on success.
 
-        Set env var FORCE_CPU=1 to bypass the NPU delegate even when the
-        libteflon.so file is present.
+        FORCE_CPU=1 skips the NPU delegate and runs the float model on CPU.
+
+        PORT: to target another NPU, change the runtime import just below plus
+        DELEGATE_PATH / NPU_MODEL_PATH above. See README "Porting to another NPU".
         """
         try:
-            from ai_edge_litert.interpreter import Interpreter, load_delegate
+            from tflite_runtime.interpreter import Interpreter, load_delegate   # PORT: runtime
         except ImportError as e:
-            print(f"[inference] ai_edge_litert not available ({e}); stub mode")
-            return
-
-        if not os.path.exists(self.model_path):
-            print(f"[inference] backbone not found at {self.model_path}; stub mode")
+            print(f"[inference] tflite_runtime not available ({e}); stub mode")
             return
 
         force_cpu = os.environ.get("FORCE_CPU") == "1"
 
-        if os.path.exists(self.delegate_path) and not force_cpu:
+        # NPU: Vela-compiled model through the Ethos-U delegate.
+        if not force_cpu and os.path.exists(NPU_MODEL_PATH) and os.path.exists(self.delegate_path):
             try:
                 delegate = load_delegate(self.delegate_path)
-                self._interp = Interpreter(model_path=self.model_path,
-                                           experimental_delegates=[delegate])
-                self.mode = "npu"
+                interp = Interpreter(model_path=NPU_MODEL_PATH,
+                                     experimental_delegates=[delegate])
+                interp.allocate_tensors()
+                self._commit(interp, NPU_MODEL_PATH, "npu")
                 print(f"[inference] NPU delegate loaded from {self.delegate_path}")
+                return
             except Exception as e:
                 print(f"[inference] NPU delegate failed ({e}); falling back to CPU")
-                self._interp = Interpreter(model_path=self.model_path)
-                self.mode = "cpu"
-        else:
-            self._interp = Interpreter(model_path=self.model_path)
-            self.mode = "cpu"
-            reason = "FORCE_CPU=1" if force_cpu else f"no delegate at {self.delegate_path}"
-            print(f"[inference] {reason}; CPU mode")
 
-        self._interp.allocate_tensors()
-        self._inp = self._interp.get_input_details()[0]
-        self._out = self._interp.get_output_details()[0]
-        print(f"[inference] backbone={os.path.basename(self.model_path)} mode={self.mode} "
+        # CPU: float model, no delegate (the Vela model is Ethos-U only, so a
+        # CPU fallback must use the float artifact, not NPU_MODEL_PATH).
+        if not os.path.exists(CPU_MODEL_PATH):
+            print(f"[inference] CPU model not found at {CPU_MODEL_PATH}; stub mode")
+            return
+        try:
+            interp = Interpreter(model_path=CPU_MODEL_PATH)
+            interp.allocate_tensors()
+            self._commit(interp, CPU_MODEL_PATH, "cpu")
+            reason = "FORCE_CPU=1" if force_cpu else "no working NPU delegate"
+            print(f"[inference] {reason}; CPU mode")
+        except Exception as e:
+            print(f"[inference] CPU load failed ({e}); stub mode")
+
+    def _commit(self, interp, model_path, mode):
+        """Latch a loaded interpreter as the active backend."""
+        self._interp = interp
+        self.model_path = model_path
+        self.mode = mode
+        self._inp = interp.get_input_details()[0]
+        self._out = interp.get_output_details()[0]
+        print(f"[inference] backbone={os.path.basename(model_path)} mode={mode} "
               f"input={self._inp['shape']} {self._inp['dtype']} "
               f"output={self._out['shape']} {self._out['dtype']}")
         print(f"[inference] input quant: {self._inp.get('quantization')}  "

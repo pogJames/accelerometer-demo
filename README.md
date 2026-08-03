@@ -7,14 +7,10 @@ Real-time vibration monitor + classifier. A tri-axial accelerometer streams raw 
 
 ## Hardware setup
 
-| Item | Detail |
-|---|---|
-| Sensor | Tri-axial accelerometer, RS485/Modbus RTU |
-| Interface | USB–RS485 adapter → `/dev/ttyUSB0..3` (up to 4 sensors) |
-| Baud rate | **3 Mbps** (required for raw streaming) |
-| Sample rate | 7812 Hz nominal (written to sensor register `0x01` on connect) |
-| Modbus FC04 | register `0x02` — FIFO count + raw XYZ samples |
-| Modbus FC03 | computed metrics (RMS, peak, kurtosis, …) — see `sensor_reader.py` register map |
+1. Matrix 800
+2. 12-24V power brick w/ terminal block (Matrix 800 power source)
+3. Tri-axial accelerometer
+4. 5V power brick (accelerometer power source)
 
 
 ## Setup & launch
@@ -77,9 +73,19 @@ W3  app.py + Flask       (serves the pages below + the HTTP API — see § HTTP 
 **Ring-buffer waveform.** `WaveformAggregator` keeps a 2 s circular sample buffer per port. The display-tick thread reads the last N samples on every tick (raw scrolls smoothly under a large overlapping window), and recomputes the FFT at ~6 Hz from the last `WINDOW_SIZE` samples.
 
 **Inference modes** (shown in sidebar):
-- `npu` — `libteflon.so` delegate loaded, int8 backbone on VeriSilicon NPU
-- `cpu` — `ai_edge_litert` without delegate
-- `stub` — no model file or no `ai_edge_litert`; dashboard still renders
+- `npu` — Ethos-U delegate loaded, Vela int8 backbone on the NXP NPU
+- `cpu` — float32 backbone via `tflite_runtime`, no delegate (`FORCE_CPU=1` or no working delegate)
+- `stub` — no model / no `tflite_runtime`; dashboard still renders
+
+**Porting to another NPU.** Single-path build targeting NXP i.MX / Ethos-U; all knobs are in `inference.py`, marked `PORT:`. Retarget = change 3 things:
+
+| What | `inference.py` | NXP (default) | Matrix800 / VeriSilicon |
+|---|---|---|---|
+| Runtime import | `_try_load_interpreter` `# PORT: runtime` | `tflite_runtime.interpreter` | `ai_edge_litert.interpreter` |
+| Delegate `.so` | `DELEGATE_PATH` | `/usr/lib/libethosu_delegate.so` | `/usr/local/lib/aarch64-linux-gnu/libteflon.so` |
+| NPU model | `NPU_MODEL_PATH` | `..._int8_vela.tflite` | `..._int8.tflite` (non-Vela) |
+
+`CPU_MODEL_PATH` fallback + `FORCE_CPU=1` bypass unchanged.
 
 
 ## HTTP API
@@ -184,7 +190,7 @@ One row per detected port; type a friendly alias (e.g. "Front-left motor") and i
 | `recorder.py` | `RecordingManager` + `delete_label()` — two-stage queue, binary writer thread |
 | `state.py` | `RollingPredictions`, `SnapshotBus`, `LatestSlot` |
 | `port_aliases.json` | Friendly-name overrides — written by `/settings`, loaded into every template's context |
-| `vibration_backbone_int8.tflite` | Frozen int8 CNN backbone (NPU target) |
+| `models/vibration_backbone_int8.tflite` | Frozen int8 CNN backbone (NPU target) |
 | `classifier_head.json` | Trained head — written by trainer, read by inference |
 | `data/` | Recordings — `<label>.bin` float32 raw XYZ |
 

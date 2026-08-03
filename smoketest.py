@@ -29,8 +29,8 @@ import time
 import numpy as np
 
 
-INT8_BACKBONE_PATH    = "output/vibration_backbone_int8.tflite"
-FLOAT_BACKBONE_PATH   = "vibration_backbone.tflite"
+INT8_BACKBONE_PATH    = "models/vibration_backbone_int8_vela.tflite"
+FLOAT_BACKBONE_PATH   = "models/vibration_backbone.tflite"
 DEFAULT_DELEGATE_PATH = "/usr/lib/libethosu_delegate.so"
 
 
