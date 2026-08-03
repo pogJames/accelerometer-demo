@@ -1,19 +1,3 @@
-"""Worker 3 — Flask dashboard. Also the entry point that wires W1, W2, W3.
-
-project4 adds:
-- /train page (feature-extractor + lightweight head training)
-- /api/recordings, /api/record/start|status|cancel endpoints (from project3)
-- /api/train/start|status|cancel endpoints (new)
-- a per-port reader subprocess that owns the local RecordingManager — main
-  process talks to it over a RemoteRecorder RPC proxy (raw samples never
-  cross the IPC boundary)
-- a TrainerManager that borrows the InferenceWorker's TFLite interpreter to
-  compute prototypes, then hot-reloads the head — no app restart needed
-
-Run with:  python app.py
-Dashboard: http://localhost:8000/
-"""
-
 import json
 import multiprocessing as mp
 import os
@@ -22,12 +6,8 @@ import sys
 import threading
 import time
 
-# Bundled deps (if any) live in ./site-packages on the embedded device —
-# we used to ship pymodbus this way; the path insert is harmless when the
-# directory is empty and the safety net stays in case something else gets
-# bundled later. On Linux (fork), child processes inherit sys.path; on
-# Windows (spawn, the default), reader_process_main re-applies it because
-# spawn gives the child a fresh interpreter with no inherited state.
+# Bundled deps live in ./site-packages on the embedded device. Harmless when
+# empty; spawned children re-apply it (see reader_process_main). pages/notes.md.
 current_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(current_path, "site-packages"))
 
@@ -49,11 +29,8 @@ ALIASES_FILENAME = "port_aliases.json"
 
 
 class PortAliases:
-    """Tiny thread-safe JSON-backed store mapping port path → friendly name.
-
-    Loaded at boot; mutated in memory by set/clear; written back to disk on
-    every change. Read access via .get(port) returns the alias if set,
-    otherwise the port string itself — keeps templates simple."""
+    # Thread-safe JSON-backed port path → friendly name store. get() returns
+    # the alias or the port string itself.
 
     def __init__(self, path):
         self._path = path
@@ -100,23 +77,21 @@ class PortAliases:
 
 
 class RemoteRecorder:
-    """Thin RPC wrapper. Reads exactly like a local RecordingManager from
-    Flask's perspective; under the hood every call round-trips over an
-    mp.Queue pair to the reader subprocess that owns the real
-    RecordingManager. Serialized with a lock so concurrent Flask requests
-    can't interleave a put-then-get pair."""
+    # RPC wrapper that reads like a local RecordingManager; every call
+    # round-trips over an mp.Queue pair to the reader subprocess. Lock
+    # serialises so concurrent Flask requests can't interleave put/get.
 
     def __init__(self, req_q, resp_q, port):
         self._req_q = req_q
         self._resp_q = resp_q
-        self._port = port               # for debug strings only
+        self._port = port               # debug strings only
         self._next_id = 0
         self._lock = threading.Lock()
 
     def _call(self, op, **kwargs):
         with self._lock:
-            # Drain any stale responses from earlier timed-out RPCs so the
-            # req_id match below stays meaningful.
+            # Drain stale responses from earlier timed-out RPCs so the req_id
+            # match below stays meaningful.
             try:
                 while True:
                     self._resp_q.get_nowait()
@@ -160,8 +135,6 @@ def build_app():
     ports = [p for p in get_existed_serial_ports() if p in ALLOWED_PORTS]
     print(f"[app] sensors detected: {ports}")
 
-    # Make sure data/ exists relative to project4 so recordings land predictably
-    # regardless of where the user launches python from.
     data_dir = os.path.join(current_path, DATA_DIR)
     os.makedirs(data_dir, exist_ok=True)
     print(f"[app] data dir: {data_dir}")
@@ -169,35 +142,25 @@ def build_app():
     head_path = os.path.join(current_path, DEFAULT_HEAD_PATH)
     aliases = PortAliases(os.path.join(current_path, ALIASES_FILENAME))
 
-    # mp.Queue crosses the process boundary; pickling cost is ~1–2 ms for
-    # a (2604, 3) float32 window — negligible vs the 167 ms hop interval.
-    # Cap at 16 so 4 readers (max_qsize=12 in sensor_reader) have headroom
-    # before put() would block; drop-oldest on the writer side kicks in
-    # well before we hit the maxsize cap.
+    # mp.Queue caps: window pickling ~1-2 ms vs 167 ms hop; cap 16 gives 4
+    # readers headroom before put() blocks (drop-oldest kicks in first).
     window_queue = mp.Queue(maxsize=16)
-    # Metrics are emitted only every ~2-5 s per port, so a small cap is plenty;
-    # the reader drops-oldest on its side if it ever backs up.
     metrics_queue = mp.Queue(maxsize=16)
-    # Fast raw-sample chunks (~217 samples ≈ 36 Hz/port) for the waveform ring.
-    raw_queue = mp.Queue(maxsize=64)
+    raw_queue = mp.Queue(maxsize=64)      # fast raw-sample chunks for waveform
     bus = SnapshotBus()
     waveform_bus = WaveformBus()
-    metrics_bus = SnapshotBus()            # generic monotonic-seq bus, reused
+    metrics_bus = SnapshotBus()
     rolling_predictions = {p: RollingPredictions(on_latch=bus.bump) for p in ports}
     waveform_agg = WaveformAggregator(ports)
 
-    # Latest computed-metric snapshot per port (filled by the drain thread).
     metrics_latest = {p: None for p in ports}
     metrics_latest_lock = threading.Lock()
 
-    # Per-port reader subprocess + RPC channel for the recorder it owns.
     req_qs   = {p: mp.Queue() for p in ports}
     resp_qs  = {p: mp.Queue() for p in ports}
     stop_events = {p: mp.Event() for p in ports}
-    # active_events gate FC04 raw streaming; metrics_events gate FC03 metric
-    # polling. Both start CLEAR — every reader is fully idle on boot. The two
-    # are independent so the /metrics page can poll metrics without paying the
-    # 3 Mbps raw-stream cost, and vice-versa.
+    # active_events gate FC04 raw streaming; metrics_events gate FC03 polling.
+    # Both start CLEAR (every reader idle on boot) and are independent.
     active_events  = {p: mp.Event() for p in ports}
     metrics_events = {p: mp.Event() for p in ports}
     reader_procs = {}
@@ -214,8 +177,6 @@ def build_app():
         reader_procs[p] = proc
         print(f"[app] spawned reader process for {p} (pid={proc.pid})")
 
-    # Drain thread: pull metric snapshots off the cross-process queue, store
-    # the latest per port, and wake any /stream/metrics SSE clients.
     def metrics_drain_loop():
         while True:
             try:
@@ -229,8 +190,6 @@ def build_app():
     threading.Thread(target=metrics_drain_loop, daemon=True,
                      name="metrics-drain").start()
 
-    # Raw-sample drain: feed fresh chunks into the waveform ring buffer. Cheap
-    # (memcpy) so it keeps up with ~144 chunks/sec (4 ports × 36 Hz).
     def raw_drain_loop():
         while True:
             try:
@@ -241,9 +200,8 @@ def build_app():
 
     threading.Thread(target=raw_drain_loop, daemon=True, name="raw-drain").start()
 
-    # Display tick: recompute waveform snapshots from the rings at a steady
-    # rate and wake SSE clients. Decouples the SSE push cadence from the
-    # 144 Hz append rate; FFT self-throttles to ~6 Hz inside render_tick().
+    # Display tick: decouples SSE push cadence from the 144 Hz append rate;
+    # FFT self-throttles inside render_tick().
     WAVEFORM_TICK_HZ = 30
 
     def waveform_tick_loop():
@@ -262,14 +220,10 @@ def build_app():
     threading.Thread(target=waveform_tick_loop, daemon=True,
                      name="waveform-tick").start()
 
-    # No CPU pinning for the main process either — the kernel schedules
-    # Flask + InferenceWorker alongside the reader subprocesses freely.
-
     recorders = {p: RemoteRecorder(req_qs[p], resp_qs[p], p) for p in ports}
 
-    # Which port's subprocess owns the active (or most-recent) recording
-    # session. Set on successful start(); never cleared, so /status keeps
-    # reporting the right subprocess's last_finished snapshot.
+    # Which port's subprocess owns the active/most-recent recording. Set on
+    # start(); never cleared, so /status keeps reporting its last_finished.
     record_state = {"port": None}
     record_state_lock = threading.Lock()
 
@@ -278,22 +232,16 @@ def build_app():
             p = record_state["port"]
         return recorders.get(p)
 
-    # The reader for a port must run if EITHER the user opened it for live
-    # inference OR a recording is in progress on it. We track those two
-    # reasons separately so that recording on a port the user never opened
-    # for inference doesn't leave it showing as "open" on the dashboard once
-    # the recording ends. `active_events[port]` (the reader gate) is derived
-    # from the union of the two sets. Lock serialises set/clear pairs.
+    # A reader runs if the user opened it for inference OR a recording is in
+    # progress. Tracked separately; active_events is the union. pages/notes.md.
     active_state_lock = threading.Lock()
-    inference_open = set()      # ports the user opened for live inference
-    recording_ports = set()     # ports held awake purely for an active recording
-    metrics_open = set()        # ports the user opened on the /metrics page
+    inference_open = set()
+    recording_ports = set()
+    metrics_open = set()
 
     def _sync_reader_locked(port):
-        """Reconcile the two reader gates from the reasons they might run.
-        Caller must hold active_state_lock. Raw streaming (active_event) runs
-        for inference or recording; metric polling (metrics_event) runs for
-        the /metrics page — independently."""
+        # Reconcile the two gates from the reasons a port might run. Caller
+        # holds active_state_lock.
         if port in inference_open or port in recording_ports:
             active_events[port].set()
         else:
@@ -304,7 +252,6 @@ def build_app():
             metrics_events[port].clear()
 
     def open_metrics(port):
-        """User opened this port on the /metrics page."""
         if port not in ports:
             raise ValueError(f"unknown port: {port!r}")
         with active_state_lock:
@@ -312,7 +259,6 @@ def build_app():
             _sync_reader_locked(port)
 
     def close_metrics(port):
-        """User left the /metrics page (or unchecked this port)."""
         if port not in ports:
             raise ValueError(f"unknown port: {port!r}")
         with active_state_lock:
@@ -320,8 +266,7 @@ def build_app():
             _sync_reader_locked(port)
 
     def open_inference(port):
-        """User opened this port for live inference. Clears the rolling buffer
-        so the dashboard shows 'waiting…' rather than stale predictions."""
+        # Clears the rolling buffer so the dashboard shows 'waiting…'.
         if port not in ports:
             raise ValueError(f"unknown port: {port!r}")
         with active_state_lock:
@@ -332,8 +277,6 @@ def build_app():
             _sync_reader_locked(port)
 
     def close_inference(port):
-        """User closed this port for live inference. The reader keeps running
-        if a recording is still in progress on it."""
         if port not in ports:
             raise ValueError(f"unknown port: {port!r}")
         with active_state_lock:
@@ -341,24 +284,20 @@ def build_app():
             _sync_reader_locked(port)
 
     def begin_recording(port):
-        """Hold the reader awake for a recording without marking the port as
-        open for inference."""
+        # Wake the reader for a recording WITHOUT marking the port open for
+        # inference, so it returns to closed once recording finishes.
         with active_state_lock:
             recording_ports.add(port)
             _sync_reader_locked(port)
 
     def end_recording(port):
-        """Release the recording hold. The reader sleeps unless the user has
-        the port open for inference."""
         with active_state_lock:
             recording_ports.discard(port)
             _sync_reader_locked(port)
 
     def release_if_finished(session):
-        """Recording auto-stops in the subprocess when the target is reached;
-        the main process only learns via a status poll. Whenever we see a
-        session that's no longer 'active', release its reader hold so a port
-        opened solely for recording falls back to closed."""
+        # Recording auto-stops in the subprocess; main learns only via status
+        # poll. Release the reader hold once a session is no longer active.
         if session and session.get("status") != "active":
             port = session.get("port")
             if port in recording_ports:
@@ -409,8 +348,7 @@ def build_app():
         head = inferer.head
         live_labels = head.labels if head is not None else ["untrained"]
         label_colors = head.label_color_map() if head is not None else {"untrained": -1}
-        # Report only ports the user opened for inference — a port whose
-        # reader is awake purely for recording must not show as open here.
+        # A port awake purely for recording must not show as open here.
         with active_state_lock:
             active_ports = [p for p in ports if p in inference_open]
         return {
@@ -426,8 +364,6 @@ def build_app():
                 static_folder="static",
                 template_folder="templates")
 
-    # Make inference_mode + ports + aliases available to every template
-    # (sidebar uses them; per-port displays read aliases).
     @app.context_processor
     def inject_globals():
         return {
@@ -461,9 +397,7 @@ def build_app():
 
     @app.route("/api/metrics_active", methods=["POST"])
     def api_set_metrics_active():
-        """Open/close FC03 metric polling for one port. Body:
-        {port, active}. The /metrics page opens every port on load and
-        closes them on unload."""
+        # Open/close FC03 polling for one port. Body: {port, active}.
         body = request.get_json(silent=True) or {}
         port = body.get("port")
         active = bool(body.get("active"))
@@ -478,8 +412,6 @@ def build_app():
 
     @app.route("/stream/metrics")
     def metrics_stream():
-        """SSE pushing the latest per-port metric snapshots. Driven by the
-        drain thread's bus bump — i.e. at the slow kurtosis cadence."""
         def gen():
             last_seq = metrics_bus.current_seq()
             yield f"data: {json.dumps(metrics_payload())}\n\n"
@@ -548,8 +480,7 @@ def build_app():
                                backbone_variant=os.path.basename(inferer.model_path),
                                backbone_present=(inferer._interp is not None))
 
-    # One-shot GET snapshots — non-streaming siblings of the /stream/* feeds,
-    # for curl/jq debugging without holding an SSE connection open.
+    # One-shot GET snapshots — non-streaming siblings of /stream/*, for curl/jq.
     @app.route("/api/inference")
     def inference_snapshot():
         return jsonify(snapshot_payload())
@@ -582,9 +513,6 @@ def build_app():
 
     @app.route("/stream/waveform")
     def waveform_stream():
-        """SSE pushing per-port live waveform snapshots at ~3 Hz/port. The
-        aggregator throttles publishing inside the inference loop; we just
-        wake on every bump and serialise the latest cached state."""
         def gen():
             last_seq = waveform_bus.current_seq()
             yield f"data: {json.dumps(waveform_agg.snapshot())}\n\n"
@@ -604,8 +532,6 @@ def build_app():
     @app.route("/api/recordings")
     def recordings():
         labels = list_existing_labels(data_dir)
-        # Decorate each label with its window count so the train page can
-        # filter by eligibility without re-reading the file.
         for entry in labels:
             entry["windows"] = entry["samples"] // WINDOW_SIZE
             entry["eligible"] = entry["windows"] >= MIN_WINDOWS
@@ -653,11 +579,8 @@ def build_app():
         if not isinstance(target_samples, int) or target_samples <= 0:
             return jsonify({"error": "target_samples must be a positive integer"}), 400
 
-        # Recording can't proceed unless the reader for this port is awake —
-        # feed() runs inside the reader subprocess, so a paused reader means
-        # zero samples committed. begin_recording wakes the reader WITHOUT
-        # marking the port as open for inference, so a port the user never
-        # opened returns to closed once the recording finishes.
+        # feed() runs in the reader subprocess — wake it first or zero samples
+        # commit. begin_recording wakes it without opening for inference.
         begin_recording(port)
 
         try:
@@ -672,9 +595,7 @@ def build_app():
 
     @app.route("/api/active_port", methods=["POST"])
     def api_set_active_port():
-        """Toggle one port's active state. Body: {port: "/dev/ttyUSB0",
-        active: true|false}. Activating one port no longer deactivates
-        others — any subset may be active simultaneously."""
+        # Toggle one port. Body: {port, active}. Any subset may be active.
         body = request.get_json(silent=True) or {}
         port = body.get("port")
         active = bool(body.get("active"))

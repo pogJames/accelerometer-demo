@@ -1,20 +1,3 @@
-"""Per-port live-waveform aggregator for the / dashboard.
-
-Fed by a fast raw-sample stream (sensor_reader emits ~217-sample chunks at
-~36 Hz/port → app.py drain thread → `append(port, chunk)`), which writes into
-a per-port circular buffer. A display-tick thread (~30 Hz) calls
-`render_tick()`, which reads the last N samples from each ring, smooths +
-decimates the raw view and (at ~6 Hz) recomputes the FFT, then stores a
-per-port snapshot. `snapshot()` is a cheap pure read for the SSE handlers.
-
-Because the ring advances under a large overlapping window, the raw view
-scrolls smoothly instead of flashing discrete hops, and "Latest N samples"
-can span up to ~1 s.
-
-FFT uses pyfftw with cached FFTW plans (so NEON SIMD on aarch64 actually
-runs). Falls back to numpy.fft.rfft if pyfftw isn't installed.
-"""
-
 import threading
 import time
 
@@ -33,19 +16,13 @@ SAVGOL_POLYORDER = 3
 
 
 def _savgol_coeffs(window_length, polyorder):
-    """Savitzky-Golay smoothing coefficients (middle row), zero scipy deps.
-
-    Standard textbook derivation: build Vandermonde matrix A where A[i, k] =
-    i**k for i in [-half, +half], solve the normal equations, return the row
-    of (A^T A)^-1 A^T corresponding to the centre point (derivative=0).
-    """
+    # Savitzky-Golay smoothing coeffs (centre row), zero scipy deps. Derivation
+    # in pages/notes.md; equivalent to scipy.signal.savgol_coeffs(W, P).
     if window_length % 2 == 0 or window_length <= polyorder:
         raise ValueError("window_length must be odd and > polyorder")
     half = window_length // 2
     i = np.arange(-half, half + 1, dtype=np.float64)
-    A = np.vander(i, polyorder + 1, increasing=True)            # (W, P+1)
-    # pinv row 0 == coefficients that recover the centre value as a least-
-    # squares polynomial fit. Equivalent to scipy.signal.savgol_coeffs(W, P).
+    A = np.vander(i, polyorder + 1, increasing=True)
     coeffs = np.linalg.pinv(A)[0]
     return coeffs.astype(np.float32)
 
@@ -55,16 +32,16 @@ SAVGOL_HALF   = SAVGOL_WINDOW // 2
 
 
 def _savgol(axis):
-    """Apply the Savitzky-Golay smoother with edge-replicated padding so the
-    first/last samples aren't pulled toward zero by np.convolve's implicit
-    zero-padding in mode='same'. Returns same-length output."""
+    # Edge-replicated padding so ends aren't pulled toward zero by convolve's
+    # implicit zero-padding. Same-length output.
     padded = np.pad(axis, SAVGOL_HALF, mode='edge')
     return np.convolve(padded, SAVGOL_COEFFS, mode='valid')
 
 
 def _load_fft_backend():
-    """Return (name, make_plan, run_plan). make_plan(N) returns an opaque
-    handle the worker passes to run_plan(handle, axis_array) per axis."""
+    # Returns (name, make_plan, run_plan). make_plan(N) → opaque handle passed
+    # to run_plan(handle, axis) per axis. pyfftw with cached plans (NEON on
+    # aarch64); numpy.fft fallback.
     try:
         import pyfftw
 
@@ -99,9 +76,8 @@ print(f"[waveform] FFT backend = {FFT_BACKEND_NAME}")
 
 
 class WaveformBus:
-    """SnapshotBus-equivalent for the waveform stream. Kept separate from
-    state.SnapshotBus so prediction and waveform SSE don't false-wake each
-    other when only one of them has new data."""
+    # Kept separate from state.SnapshotBus so prediction/waveform SSE don't
+    # false-wake each other.
 
     def __init__(self):
         self._cv = threading.Condition()
@@ -123,9 +99,8 @@ class WaveformBus:
 
 
 class WaveformAggregator:
-    """Per-port latest-window store. publish() is called from the inference
-    thread on every window; throttle and compute happen inline. snapshot()
-    is called from Flask request threads to read the latest state."""
+    # Per-port ring buffer + latest snapshot. append() from the raw drain
+    # thread, render_tick() from the display tick, snapshot() from Flask.
 
     def __init__(self, ports, window_size=WINDOW_SIZE, sample_rate=SAMPLE_RATE,
                  display_points=DISPLAY_POINTS, ring_capacity=RING_CAPACITY):
@@ -135,14 +110,11 @@ class WaveformAggregator:
         self._ports = list(ports)
         self._ring_cap = ring_capacity
 
-        # How many of the most recent samples raw mode shows — user-tunable
-        # (set_raw_samples). The ring now holds ~2 s, so this can span up to
-        # ~1 s. Default ≈ the old freshest-hop view.
+        # How many recent samples raw mode shows (user-tunable). Ring holds ~2 s.
         self.raw_max_samples = sample_rate                 # up to 1 s
         self.raw_samples = min(window_size // 2, self.raw_max_samples)
 
-        # FFT bin count (user-tunable, set_fft_max_hz). bin = sample_rate/
-        # window_size ≈ 3 Hz; cap at the rFFT Nyquist bin count.
+        # FFT bin count (user-tunable). bin = sample_rate/window_size ≈ 3 Hz.
         self.bin_hz = sample_rate / window_size
         self.fft_max_bins = window_size // 2
         self.fft_bins = min(display_points // 2, self.fft_max_bins)
@@ -152,9 +124,8 @@ class WaveformAggregator:
         self._raw_seq = {p: 0 for p in ports}
         self._fft_seq = {p: 0 for p in ports}
 
-        # Per-port circular sample buffer. _ring_w = next write index,
-        # _ring_n = total samples ever written (monotonic), _rendered_n =
-        # _ring_n at the last render (skip recompute when no new data).
+        # _ring_w = next write index, _ring_n = total ever written (monotonic),
+        # _rendered_n = _ring_n at last render (skip recompute when unchanged).
         self._ring = {p: np.zeros((ring_capacity, 3), dtype=np.float32) for p in ports}
         self._ring_w = {p: 0 for p in ports}
         self._ring_n = {p: 0 for p in ports}
@@ -166,14 +137,11 @@ class WaveformAggregator:
         self.raw_axis = self._make_raw_axis(self.raw_samples)
         self.freq_axis_hz = self._make_freq_axis(self.fft_bins)
 
-    # ── axes / setters ────────────────────────────────────────────────
     def _make_freq_axis(self, bins):
         return (np.arange(1, bins + 1, dtype=np.float32) * self.bin_hz).tolist()
 
     def _make_raw_axis(self, n):
-        """'Samples ago' axis, ascending 0..n-1, length min(n, display_points).
-        0 = latest sample; the client reverses the scale so it sits on the
-        right edge while tick labels stay rounded."""
+        # 'Samples ago' axis, 0 = latest; client reverses so it sits on the right.
         m = min(n, self.display_points)
         return np.linspace(0.0, n - 1, m, dtype=np.float32).tolist()
 
@@ -194,10 +162,8 @@ class WaveformAggregator:
             self.raw_axis = axis
         return n
 
-    # ── ingest ────────────────────────────────────────────────────────
     def append(self, port, chunk):
-        """Write a fresh (k, 3) sample chunk into the port's ring buffer.
-        Called from the raw_queue drain thread (~36 Hz/port). Cheap memcpy."""
+        # Write a fresh (k, 3) chunk into the ring. Cheap memcpy.
         if port not in self._ring:
             return
         k = chunk.shape[0]
@@ -219,8 +185,7 @@ class WaveformAggregator:
             self._ring_n[port] += k
 
     def _tail_locked(self, port, n):
-        """Last `n` samples (oldest→latest), honoring wrap. Caller holds lock.
-        Returns None if fewer than `n` samples have been written."""
+        # Last `n` samples (oldest→latest), honoring wrap. None if < n written.
         total = self._ring_n[port]
         if total < n:
             return None
@@ -231,12 +196,10 @@ class WaveformAggregator:
             return ring[start:start + n].copy()
         return np.concatenate([ring[start:], ring[:(start + n) - cap]], axis=0)
 
-    # ── render (display tick) ─────────────────────────────────────────
     def render_tick(self):
-        """Recompute per-port snapshots from the rings. Called by the display-
-        tick thread at TICK_HZ. Raw recomputed every tick (scroll); FFT only
-        ~every FFT_INTERVAL_S. Skips ports with no new samples since last
-        render. Returns True if anything changed (caller bumps the bus)."""
+        # Recompute per-port snapshots. Raw every tick (scroll); FFT ~every
+        # FFT_INTERVAL_S. Skips ports with no new samples. Returns True if
+        # anything changed (caller bumps the bus).
         now = time.monotonic()
         with self._lock:
             raw_n = self.raw_samples
@@ -288,8 +251,7 @@ class WaveformAggregator:
         return True
 
     def _raw_from_tail(self, tail):
-        """Smoothed, decimated, reversed ('samples ago') view of a tail of
-        length raw_samples → display_points points."""
+        # Smoothed, decimated, reversed ('samples ago') view → display_points.
         n = tail.shape[0]
         m = min(n, self.display_points)
         x_ago = np.linspace(0.0, n - 1, m)
@@ -302,8 +264,7 @@ class WaveformAggregator:
         return out
 
     def _fft_from_tail(self, plan, tail, bins):
-        """Magnitude of the first `bins` rFFT bins (DC excluded) of a
-        window_size-length tail, per axis."""
+        # Magnitude of the first `bins` rFFT bins (DC excluded), per axis.
         out = {}
         for i, name in enumerate(("x", "y", "z")):
             axis = np.ascontiguousarray(tail[:, i], dtype=np.float32)
@@ -311,9 +272,7 @@ class WaveformAggregator:
             out[name] = mag[1:1 + bins].astype(np.float32).tolist()
         return out
 
-    # ── read (SSE) ────────────────────────────────────────────────────
     def snapshot(self):
-        """Cheap pure read of the latest per-port snapshots + axes."""
         with self._lock:
             ports_out = {}
             for port in self._ports:

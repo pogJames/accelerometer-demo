@@ -1,5 +1,3 @@
-"""Shared state primitives used by all three workers (project4 — backbone + head)."""
-
 import threading
 import time
 from collections import Counter, deque
@@ -8,14 +6,8 @@ from classifier import ClassifierHead, DEFAULT_HEAD_PATH
 
 
 def load_class_labels():
-    """Resolve class labels from the trained head on disk, or fall back to a
-    single 'untrained' placeholder if no head exists yet.
-
-    Only used as a startup hint for templates and the dashboard's colour map.
-    The authoritative class name per prediction comes from `InferenceWorker`
-    at invoke time, which reads `self.head.labels` directly — so this constant
-    being a snapshot of an earlier head is fine.
-    """
+    # Startup hint only; authoritative label per prediction comes from the
+    # head live at invoke time. See pages/notes.md.
     head = ClassifierHead.load(DEFAULT_HEAD_PATH)
     return head.labels if head else ["untrained"]
 
@@ -27,8 +19,6 @@ ROLLING_WINDOW = 7
 
 
 class LatestSlot:
-    """Atomic last-value slot. Producers call set(); consumers call get()."""
-
     def __init__(self):
         self._lock = threading.Lock()
         self._value = None
@@ -45,15 +35,6 @@ class LatestSlot:
 
 
 class SnapshotBus:
-    """Broadcaster that wakes any number of SSE clients whenever a port
-    latches a new snapshot.
-
-    Each latch increments a monotonic counter and notifies all waiters.
-    SSE generators track their last-seen counter so they don't miss
-    notifications even if multiple clients are connected and one of them
-    was momentarily slow.
-    """
-
     def __init__(self):
         self._cv = threading.Condition()
         self._seq = 0
@@ -68,22 +49,12 @@ class SnapshotBus:
             return self._seq
 
     def wait_for_change(self, last_seen_seq, timeout=None):
-        """Block until self._seq > last_seen_seq, or timeout. Returns the
-        current sequence number (which may equal last_seen_seq if timed out)."""
         with self._cv:
             self._cv.wait_for(lambda: self._seq > last_seen_seq, timeout=timeout)
             return self._seq
 
 
 class RollingPredictions:
-    """Per-port rolling buffer of the last N inference results plus an
-    event-driven 'displayable snapshot' that only refreshes once every
-    DISPLAY_REFRESH_EVERY pushes.
-
-    On each latch, calls the optional `on_latch` callback so an external
-    SnapshotBus can broadcast to SSE clients.
-    """
-
     def __init__(self, maxlen=ROLLING_WINDOW, refresh_every=DISPLAY_REFRESH_EVERY,
                  on_latch=None):
         self._lock = threading.Lock()
@@ -103,8 +74,7 @@ class RollingPredictions:
                 self._displayable = self._build_snapshot_locked()
                 self._pending = 0
                 latched = True
-        # Fire the callback OUTSIDE the lock — bus.bump() acquires its own
-        # condition's lock, and we don't want to nest.
+        # Fire OUTSIDE the lock — bus.bump() takes its own lock, don't nest.
         if latched and self._on_latch is not None:
             self._on_latch()
 
@@ -112,9 +82,7 @@ class RollingPredictions:
         if not self._buf:
             return None
 
-        # Majority class over the rolling window. Counter.most_common picks one
-        # winner deterministically; we tie-break by recency by walking the deque
-        # in reverse and preferring the most-recent class among the tied top.
+        # Majority class, tie-broken by recency (walk deque in reverse).
         counts = Counter(p["class_id"] for p in self._buf)
         top_count = counts.most_common(1)[0][1]
         tied = {cid for cid, c in counts.items() if c == top_count}
@@ -124,10 +92,8 @@ class RollingPredictions:
         for p in reversed(self._buf):
             if p["class_id"] in tied:
                 majority_class_id = p["class_id"]
-                # Use the class_name InferenceWorker stored on the prediction
-                # itself — this reflects the head that was live when the
-                # window was classified, so a retrain mid-session immediately
-                # surfaces the new labels instead of stale CLASS_LABELS.
+                # Stored class_name reflects the head live when classified, so
+                # a mid-session retrain surfaces new labels immediately.
                 majority_class_name = p.get("class_name")
                 break
 
@@ -152,10 +118,8 @@ class RollingPredictions:
             return self._displayable
 
     def clear(self):
-        """Drop the rolling buffer and current displayable snapshot, then
-        notify SSE clients so the UI immediately re-renders as 'waiting…'.
-        Called by app.py when switching the active sensor — stale predictions
-        from the previous activation shouldn't influence the new majority."""
+        # Called by app.py when switching active sensor so stale predictions
+        # don't influence the new majority; notify SSE to re-render 'waiting…'.
         with self._lock:
             self._buf.clear()
             self._displayable = None

@@ -1,13 +1,5 @@
-"""Convert recorder .bin files (raw float32 XYZ, 3 channels interleaved, no
-header) to .csv with an `x,y,z` header. No timestamps — the .bin format never
-stored them.
-
-Usage:
-    python bin2csv.py data/steady.bin data/shake.bin   # specific files
-    python bin2csv.py data/*.bin                        # shell glob
-    python bin2csv.py data                              # every .bin in a dir
-"""
-
+# Convert recorder .bin (raw float32 XYZ, no header) → .csv with x,y,z header.
+# Usage in pages/notes.md.
 import glob
 import os
 import sys

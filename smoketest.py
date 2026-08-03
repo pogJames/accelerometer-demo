@@ -1,26 +1,6 @@
-"""smoketest.py — verify the backbone .tflite works in isolation
-and measure pure invoke latency. No sensor / Flask / multiprocessing —
-just the model.
-
-Two things this catches:
-
-1. Silent NPU corruption. A float32 .tflite loaded through libteflon.so
-   doesn't error and doesn't warn — it returns bit-identical garbage for
-   every input. Pushing zeros/ones/random and checking the outputs
-   actually differ is the cheapest way to confirm the model is honest.
-
-2. NPU vs CPU latency. We time N invokes and report min/mean/max, plus
-   (optionally) a CPU run for comparison. Use this to ground-truth what
-   "the NPU can do" before chasing inference throughput at the integration
-   layer.
-
-Usage:
-    python smoketest.py                   # NPU (fall back to CPU)
-    FORCE_CPU=1 python smoketest.py       # CPU only
-    python smoketest.py --runs 500        # more samples for stable timing
-    python smoketest.py --compare         # run both NPU and CPU, print both
-"""
-
+# Verify the backbone .tflite in isolation + measure invoke latency. No sensor
+# / Flask / mp. Catches silent NPU corruption (identical outputs for distinct
+# inputs) and reports NPU vs CPU latency. Usage + rationale in pages/notes.md.
 import argparse
 import os
 import sys
@@ -45,7 +25,6 @@ def resolve_model_path():
 
 
 def build_interpreter(model_path, use_npu):
-    """Returns (interpreter, mode_str). mode_str is 'npu' or 'cpu'."""
     try:
         from tflite_runtime.interpreter import Interpreter, load_delegate
     except ImportError as e:
@@ -67,8 +46,7 @@ def build_interpreter(model_path, use_npu):
 
 
 def quantize_input(window, inp_detail):
-    """Float32 window → quantized tensor matching the model's expected dtype.
-    Mirrors inference.py:embed() so the smoketest measures the same path."""
+    # Mirrors inference.py:embed() so the smoketest measures the same path.
     if inp_detail["dtype"] == np.int8:
         scale, zero_point = inp_detail["quantization"]
         x = np.clip(np.round(window / scale + zero_point), -128, 127).astype(np.int8)
@@ -88,7 +66,6 @@ def dequantize_output(y_raw, out_detail):
 
 
 def invoke_once(interp, inp, out, window_f32):
-    """One full embed pass (quantize + set + invoke + get + dequantize)."""
     x = quantize_input(window_f32, inp)
     interp.set_tensor(inp["index"], x)
     interp.invoke()
@@ -97,10 +74,8 @@ def invoke_once(interp, inp, out, window_f32):
 
 
 def time_invokes(interp, inp, out, runs):
-    """Returns a list of per-invoke seconds. Skips the first invoke as
-    warm-up — first call on the NPU often eats setup cost."""
+    # Skips the first invoke as warm-up (first NPU call eats setup cost).
     feat_shape = (inp["shape"][1], inp["shape"][2])
-    # Warm-up
     invoke_once(interp, inp, out, np.random.uniform(-1, 1, feat_shape).astype(np.float32))
     times = []
     for _ in range(runs):
@@ -112,9 +87,8 @@ def time_invokes(interp, inp, out, runs):
 
 
 def differ_check(interp, inp, out):
-    """Push three very different inputs and confirm outputs actually change.
-    Returns True if outputs differ pairwise; False if the model is returning
-    identical embeddings for distinct inputs (silent failure)."""
+    # Push zeros/ones/random; True if outputs differ pairwise. False = silent
+    # failure (identical embeddings for distinct inputs).
     feat_shape = (inp["shape"][1], inp["shape"][2])
     zeros = np.zeros(feat_shape, dtype=np.float32)
     ones  = np.ones(feat_shape, dtype=np.float32)
@@ -167,8 +141,7 @@ def run_one(model_path, use_npu, runs):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=200,
                         help="number of timed invokes (default 200)")
     parser.add_argument("--compare", action="store_true",

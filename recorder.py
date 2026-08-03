@@ -1,16 +1,3 @@
-"""Recording manager — captures raw XYZ samples to binary alongside live inference.
-
-Two-stage queue: feed() (called from W1) appends to a stage-1 list under a
-brief lock, no I/O. Once FLUSH_SIZE samples accumulate, the chunk is pushed
-to a writer queue drained by a dedicated thread that flushes ~1×/sec.
-Keeps W1 off the disk so read loop stays on the 7812 Hz sensor rate.
-
-Binary format: raw float32 little-endian, 3 channels (x_g, y_g, z_g) interleaved,
-no header. `.bin` extension. Sample count = file_size // 12. Append mode works
-trivially — just open "ab" and write more bytes. Legacy `.csv` files in data/
-are still readable by trainer.py for back-compat; new recordings always go to `.bin`.
-"""
-
 import os
 import queue
 import re
@@ -36,23 +23,18 @@ def sanitize_name(name: str) -> str:
 
 
 def _count_csv_samples(path: str) -> int:
-    """Legacy: count data rows in a .csv (subtracts the header)."""
     with open(path, "r", newline="") as f:
         rows = sum(1 for _ in f)
-    return max(0, rows - 1)
+    return max(0, rows - 1)     # minus header
 
 
 def list_existing_labels(data_dir: str = DATA_DIR):
-    """Returns [{name, samples, file_size, mtime, path}] for every data/*.bin
-    and any back-compat data/*.csv that doesn't have a .bin twin.
-
-    `.bin` sample count is O(1) (file_size // SAMPLE_BYTES). `.csv` falls back
-    to a line scan for legacy files.
-    """
+    # [{name, samples, file_size, mtime, path}] for every data/*.bin and any
+    # *.csv without a .bin twin. .bin sample count is O(1); .csv line-scans.
     if not os.path.isdir(data_dir):
         return []
 
-    by_name = {}    # name -> entry; .bin overrides .csv of the same name
+    by_name = {}    # .bin overrides .csv of the same name
     for fname in sorted(os.listdir(data_dir)):
         if fname.endswith(".bin"):
             ext = ".bin"
@@ -82,12 +64,9 @@ def list_existing_labels(data_dir: str = DATA_DIR):
 
 
 def delete_label(data_dir: str, name: str):
-    """Delete the recording files for `name` (both .bin and legacy .csv twin).
-    `name` must match what `list_existing_labels` returns — we DO NOT re-sanitize
-    it (that would mangle e.g. leading underscores). Instead we reject path
-    separators and confirm the resolved path lives directly in data_dir.
-    Returns the list of removed filenames. Raises ValueError on an invalid
-    name or if nothing exists."""
+    # `name` must match list_existing_labels output — we do NOT re-sanitize
+    # (that would mangle leading underscores). Reject separators + confirm the
+    # resolved path sits directly in data_dir. Returns removed filenames.
     name = (name or "").strip()
     if not name or "/" in name or "\\" in name or "\x00" in name or name in (".", ".."):
         raise ValueError("invalid name")
@@ -95,8 +74,7 @@ def delete_label(data_dir: str, name: str):
     removed = []
     for ext in (".bin", ".csv"):
         path = os.path.abspath(os.path.join(data_dir, f"{name}{ext}"))
-        # Guard against traversal: the file must sit directly in data_dir.
-        if os.path.dirname(path) != data_dir_abs:
+        if os.path.dirname(path) != data_dir_abs:   # traversal guard
             raise ValueError("invalid name")
         if os.path.isfile(path):
             try:
@@ -117,7 +95,7 @@ class RecordingSession:
         self.mode = mode                       # "append" | "overwrite"
         self.file_path = file_path
         self.started_ts = time.time()
-        self.samples_written = 0               # advances in feed(); = samples committed to recording
+        self.samples_written = 0
         self.status = "active"                 # "active" | "complete" | "cancelled" | "error"
         self.error = None
 
@@ -141,7 +119,8 @@ class RecordingSession:
 
 
 class RecordingManager:
-    """Thread-safe singleton driving at most one recording session at a time."""
+    # At most one recording session at a time. See pages/notes.md for the two-stage
+    # queue and binary format.
 
     def __init__(self, data_dir: str = DATA_DIR):
         self._lock = threading.Lock()
@@ -179,7 +158,6 @@ class RecordingManager:
             self._session = session
             self._stage1_chunks = []
             self._stage1_n = 0
-            # Unbounded queue; feed() self-enforces a soft cap via drop-oldest.
             self._writer_queue = queue.Queue()
             self._last_finished = None
 
@@ -192,12 +170,8 @@ class RecordingManager:
             return session.to_dict()
 
     def feed(self, port: str, samples: np.ndarray):
-        """Hot path — called from W1 on every Modbus read. NO disk I/O.
-
-        Append the chunk to a stage-1 list, bump samples_written, and only
-        push to the writer queue when we've accumulated FLUSH_SIZE samples
-        (or when the session has reached its target — a final partial chunk).
-        """
+        # Hot path — called from W1 on every read. NO disk I/O: append to a
+        # stage-1 list, only push to the writer queue at FLUSH_SIZE or target.
         s = self._session
         if s is None or s.status != "active" or s.port != port:
             return
@@ -235,10 +209,7 @@ class RecordingManager:
 
         chunk = chunks_to_flush[0] if len(chunks_to_flush) == 1 else np.vstack(chunks_to_flush)
 
-        # Drop-oldest with warning if writer fell behind. Mirrors the inference
-        # window queue's overflow handling in sensor_reader.RawWindowReader and
-        # raw_data_logger.py:99-102.
-        while wq.qsize() >= MAX_WRITER_Q:
+        while wq.qsize() >= MAX_WRITER_Q:       # drop-oldest if writer fell behind
             print("[recorder] Warning! Writer queue overwrite (disk too slow?)")
             try:
                 wq.get_nowait()
@@ -250,12 +221,8 @@ class RecordingManager:
             wq.put(_SENTINEL)
 
     def cancel(self):
-        """Mark the session cancelled and ask the writer to drain & exit.
-
-        Blocks up to WRITER_JOIN_TIMEOUT_S waiting for the writer to flush
-        whatever it's already accepted, so by the time this returns the
-        last_finished snapshot reports the truthful on-disk sample count.
-        """
+        # Mark cancelled, hand the writer the leftover buffer, then block up to
+        # WRITER_JOIN_TIMEOUT_S so last_finished reports the true on-disk count.
         with self._lock:
             s = self._session
             if s is None or s.status != "active":
@@ -267,7 +234,6 @@ class RecordingManager:
             wq = self._writer_queue
             wt = self._writer_thread
 
-        # Hand the leftover stage-1 buffer to the writer, then nudge it to exit.
         if chunks:
             chunk = chunks[0] if len(chunks) == 1 else np.vstack(chunks)
             wq.put(chunk)
@@ -284,13 +250,8 @@ class RecordingManager:
             return self._last_finished
 
     def _writer_loop(self, f, session, wq):
-        """Stage-2 thread: drains the queue, writes binary, flushes once per chunk.
-
-        `ndarray.tofile` is a C-level write that releases the GIL during the
-        actual bytes-to-disk handoff — that's the whole point of the binary
-        format. Pure-Python CSV formatting (the previous approach) held the
-        GIL for the entire chunk and starved the reader's modbus poll loop.
-        """
+        # Stage-2: drain queue, write binary, flush per chunk. tofile releases
+        # the GIL during the disk handoff — the point of the binary format.
         try:
             while True:
                 try:

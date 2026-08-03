@@ -27,8 +27,9 @@ pip install -r requirements.txt
 
 # 2. 執行
 python app.py                   # http://localhost（port 80）
-FORCE_CPU=1 python app.py       # 繞過 NPU delegate（除錯／開發機）
 ```
+
+在目標板以外（沒有 `tflite_runtime` / Ethos-U delegate）推論會以 `stub` 模式執行——其餘功能開發時皆可正常運作。
 
 App 會自動偵測 `ALLOWED_PORTS`（`/dev/ttyUSB0..3`）中列出的序列埠。每偵測到一顆感測器就產生一個 reader 子行程。
 
@@ -77,9 +78,8 @@ W3  app.py + Flask       （提供以下頁面 + HTTP API — 參見 § HTTP API
 **環形緩衝波形。** `WaveformAggregator` 為每個 port 維護 2 秒的環形取樣緩衝。display-tick 執行緒每個 tick 讀取最後 N 個取樣（原始波形在大範圍重疊視窗下平順捲動），並以 ~6 Hz 從最後 `WINDOW_SIZE` 個取樣重新計算 FFT。
 
 **推論模式**（顯示於側邊欄）：
-- `npu` — 已載入 Ethos-U delegate，Vela int8 主幹跑在 NXP NPU 上
-- `cpu` — 透過 `tflite_runtime` 跑 float32 主幹，不使用 delegate（`FORCE_CPU=1` 或沒有可用的 delegate）
-- `stub` — 沒有模型檔或沒有 `tflite_runtime`；儀表板仍可正常渲染
+- `npu` — 已載入 Ethos-U delegate，Vela int8 主幹跑在 NXP NPU 上（唯一真正的後端）
+- `stub` — runtime、模型或 delegate 缺任一 → 儀表板仍可渲染。沒有 CPU fallback：在硬體以外一律落到這裡。
 
 **移植到其他 NPU。** 這是針對 NXP i.MX / Ethos-U 的單一路徑建置；所有旋鈕都在 `inference.py`，以 `PORT:` 標記。重新指定目標 = 改 3 個地方：
 
@@ -88,8 +88,6 @@ W3  app.py + Flask       （提供以下頁面 + HTTP API — 參見 § HTTP API
 | Runtime import | `_try_load_interpreter` `# PORT: runtime` | `tflite_runtime.interpreter` | `ai_edge_litert.interpreter` |
 | Delegate `.so` | `DELEGATE_PATH` | `/usr/lib/libethosu_delegate.so` | `/usr/local/lib/aarch64-linux-gnu/libteflon.so` |
 | NPU 模型 | `NPU_MODEL_PATH` | `..._int8_vela.tflite` | `..._int8.tflite`（非 Vela） |
-
-`CPU_MODEL_PATH` fallback 與 `FORCE_CPU=1` 繞過不變。
 
 
 ## HTTP API
@@ -194,7 +192,8 @@ W3  app.py + Flask       （提供以下頁面 + HTTP API — 參見 § HTTP API
 | `recorder.py` | `RecordingManager` + `delete_label()` — 兩階段佇列，二進位寫入執行緒 |
 | `state.py` | `RollingPredictions`、`SnapshotBus`、`LatestSlot` |
 | `port_aliases.json` | 別名覆寫 — 由 `/settings` 寫入，載入到每個模板的 context |
-| `models/vibration_backbone_int8.tflite` | 凍結的 int8 CNN 主幹（NPU 目標） |
+| `models/vibration_backbone_int8_vela.tflite` | 凍結的 int8 CNN 主幹，Vela 編譯——實際載入的 NPU 主幹（Ethos-U） |
+| `models/vibration_backbone_int8.tflite` | 非 Vela 的 int8 主幹——僅供 VeriSilicon 移植使用（見「移植」） |
 | `classifier_head.json` | 訓練好的分類頭 — 由 trainer 寫入，供 inference 讀取 |
 | `data/` | 錄製檔 — `<label>.bin` float32 原始 XYZ |
 

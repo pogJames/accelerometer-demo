@@ -1,13 +1,3 @@
-"""Trainer — computes class prototypes from recorded data (.bin or legacy .csv).
-
-"Training" here is just: for each selected label, run every (WINDOW, 3) window
-through the backbone, average the resulting embeddings to a single 128-d
-prototype, write all prototypes to `classifier_head.json`, and ask the live
-`InferenceWorker` to hot-reload its head. No TF, no gradients, takes seconds.
-
-Singleton + background thread + status pattern mirrors `recorder.py`.
-"""
-
 import os
 import random
 import threading
@@ -19,22 +9,15 @@ import pandas as pd
 from classifier import ClassifierHead, DEFAULT_HEAD_PATH, PALETTE_SIZE
 
 
-WINDOW_SIZE = 2604               # must match train_backbone.py / sensor_reader.py
+WINDOW_SIZE = 2604               # must match sensor_reader.py
 MIN_WINDOWS = 6                  # 6 × 2604 = 2.0 s of recording — permissive floor
-# Stride between training windows. WINDOW_SIZE // 4 → 75 % overlap → 4 distinct
-# phase alignments per gesture cycle (offsets 0, 651, 1302, 1953 samples mod
-# WINDOW_SIZE). Yields ~4× more training samples per recording than the old
-# non-overlapping slicing. 50 % overlap was tempting (only 2× compute) but
-# 2604 / 1302 = 2, so 50 % hop hits only 2 phase positions — strictly worse
-# phase coverage than 25 % overlap. 75 % is the sweet spot for this geometry.
-TRAIN_HOP = WINDOW_SIZE // 4
-
+TRAIN_HOP = WINDOW_SIZE // 4     # 75 % overlap → 4 phase alignments. See pages/notes.md.
 
 SAMPLE_BYTES = 4 * 3            # float32 * 3 channels — must match recorder.SAMPLE_BYTES
 
 
 def _label_path(data_dir: str, label: str):
-    """Return (path, ext) for whichever format exists. .bin wins if both do."""
+    # Returns (path, ext); .bin wins if both exist.
     bin_path = os.path.join(data_dir, f"{label}.bin")
     if os.path.exists(bin_path):
         return bin_path, ".bin"
@@ -45,17 +28,8 @@ def _label_path(data_dir: str, label: str):
 
 
 def load_label_windows(data_dir: str, label: str) -> np.ndarray:
-    """Read data/<label>.bin or .csv → (N_windows, WINDOW_SIZE, 3) float32.
-
-    Windows are extracted with TRAIN_HOP stride (75 % overlap), giving ~4×
-    the training samples a non-overlapping slice would produce. The benefit
-    is twofold: lower variance on the prototype mean estimate, and broader
-    phase coverage so the prototype matches inference-time windows
-    regardless of where the live gesture happens to start within the window.
-
-    Returns an empty (0, WINDOW_SIZE, 3) array if the file is missing or
-    has fewer than WINDOW_SIZE samples.
-    """
+    # → (N_windows, WINDOW_SIZE, 3) float32 at TRAIN_HOP stride. Empty array if
+    # the file is missing or has < WINDOW_SIZE samples.
     path, ext = _label_path(data_dir, label)
     if path is None:
         return np.empty((0, WINDOW_SIZE, 3), dtype=np.float32)
@@ -73,16 +47,14 @@ def load_label_windows(data_dir: str, label: str) -> np.ndarray:
     if arr.shape[0] < WINDOW_SIZE:
         return np.empty((0, WINDOW_SIZE, 3), dtype=np.float32)
 
-    # Sliding-window extraction. np.stack copies the slices so we don't ship
-    # strided views into downstream code; the embed() pass would have to
-    # copy anyway since TFLite needs contiguous buffers.
+    # np.stack copies the slices (TFLite needs contiguous buffers anyway).
     last_start = arr.shape[0] - WINDOW_SIZE
     starts = range(0, last_start + 1, TRAIN_HOP)
     return np.stack([arr[s:s + WINDOW_SIZE] for s in starts])
 
 
 def count_windows(data_dir: str, label: str) -> int:
-    """Cheap window count. O(1) for .bin via file_size; line scan for legacy .csv."""
+    # O(1) for .bin via file_size; line scan for legacy .csv.
     path, ext = _label_path(data_dir, label)
     if path is None:
         return 0
@@ -123,7 +95,7 @@ class TrainingSession:
 
 
 class TrainerManager:
-    """At most one training session at a time."""
+    # At most one training session at a time.
 
     def __init__(self, data_dir: str, head_path: str = DEFAULT_HEAD_PATH):
         self._lock = threading.Lock()
@@ -139,8 +111,7 @@ class TrainerManager:
         if len(labels) < 2:
             raise ValueError("select at least 2 labels")
 
-        # Resolve files + window counts before spawning the thread so we can
-        # surface friendly errors synchronously to the HTTP caller.
+        # Validate synchronously so the HTTP caller gets friendly errors.
         for lbl in labels:
             path, _ext = _label_path(self.data_dir, lbl)
             if path is None:
@@ -213,9 +184,8 @@ class TrainerManager:
                 print(f"[trainer] {label}: {windows.shape[0]} windows → prototype "
                       f"(norm={float(np.linalg.norm(proto)):.3f})")
 
-            # Random colour assignment per train. ≤ PALETTE_SIZE labels get
-            # distinct slots; beyond that we wrap. Uses Python's RNG, not
-            # numpy's, so external numpy seeding can't make the shuffle stable.
+            # Random colour per train (uses Python RNG, not numpy's, so external
+            # numpy seeding can't make the shuffle stable). See pages/notes.md.
             n = len(session.selected_labels)
             if n <= PALETTE_SIZE:
                 colors = random.sample(range(PALETTE_SIZE), n)
