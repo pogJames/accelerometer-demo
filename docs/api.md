@@ -48,8 +48,8 @@ curl -N http://<board-ip>/stream/inference
 
 | Endpoint | Body | Effect |
 |---|---|---|
-| `POST /api/active_port` | `{port, active}` | Open/close a port for **raw + inference** streaming |
-| `POST /api/metrics_active` | `{port, active}` | Open/close **FC03 metric** polling (independent of raw) |
+| `POST /api/active_port` | `{port, active}` | Open/close a port for **raw waveform + inference** streaming |
+| `POST /api/metrics_active` | `{port, active}` | Open/close **metrics** streaming (independent of raw) |
 | `POST /api/waveform_config` | `{fft_max_hz?, raw_samples?}` | Set live waveform/FFT knobs |
 | `POST /api/port_alias` | `{port, alias}` | Set a port's friendly name |
 
