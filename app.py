@@ -548,9 +548,19 @@ def build_app():
                                backbone_variant=os.path.basename(inferer.model_path),
                                backbone_present=(inferer._interp is not None))
 
-    @app.route("/api/metrics")
-    def metrics():
+    # One-shot GET snapshots — non-streaming siblings of the /stream/* feeds,
+    # for curl/jq debugging without holding an SSE connection open.
+    @app.route("/api/inference")
+    def inference_snapshot():
         return jsonify(snapshot_payload())
+
+    @app.route("/api/metrics")
+    def metrics_snapshot():
+        return jsonify(metrics_payload())
+
+    @app.route("/api/waveform")
+    def waveform_snapshot():
+        return jsonify(waveform_agg.snapshot())
 
     @app.route("/stream/inference")
     def stream():
