@@ -101,6 +101,10 @@ curl -s http://<board-ip>/api/inference | jq
 
 ### `/` — live waveform
 
+<p float="left">
+    <img src="waveform.png" width="50%">
+</p>
+
 - **Raw mode** — scrolling time trace, X/Y/Z overlaid. "Latest N samples" up to
   1 s. Refresh rate 10/30/60 fps.
 - **FFT mode** — magnitude spectrum, range in Hz (caps at 800 Hz).
@@ -109,10 +113,18 @@ curl -s http://<board-ip>/api/inference | jq
 
 ### `/inference` — live class
 
+<p float="left">
+    <img src="inference.png" width="50%">
+</p>
+
 One card per sensor. Shows the majority class over the last 7 results, the
 latest confidence, and a colour-coded dot strip. SSE-driven, no polling.
 
 ### `/metrics` — metric tables
+
+<p float="left">
+    <img src="metrics.png" width="50%">
+</p>
 
 Per-sensor card: temperature, a gravity table (RMS / Peak / Crest / Skewness /
 Kurtosis × XYZ + primary freq) and a velocity table (RMS / Peak / Crest × XYZ +
@@ -122,6 +134,10 @@ Activating `/metrics` starts FC03 polling only, not raw streaming. Raw streaming
 (from `/` or `/inference`) always preempts metric polling on the same port.
 
 ### `/record` — record data
+
+<p float="left">
+    <img src="record.png" width="50%">
+</p>
 
 Records raw XYZ to `data/<name>.bin` (float32 little-endian, 3 channels
 interleaved). Append or Overwrite mode. Progress streams over SSE. Each row in
@@ -134,6 +150,10 @@ python bin2csv.py data/<name>.bin      # also accepts a glob or a directory
 ```
 
 ### `/train` — train the head
+
+<p float="left">
+    <img src="train.png" width="50%">
+</p>
 
 "Training" computes one mean embedding per label. No gradients, seconds. Pick 2+
 eligible labels → **Train model** → `classifier_head.json` is written and the

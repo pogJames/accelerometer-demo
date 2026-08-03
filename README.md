@@ -5,7 +5,9 @@ A tri-axial accelerometer streams raw XYZ over Modbus RTU → a frozen CNN backb
 runs on the NPU → a cosine-similarity head labels the motion → a live Flask
 dashboard shows the waveform, FFT, sensor metrics, and class.
 
-![Screenshot](./docs/SETUP.jpeg)
+<p float="left">
+    <img src="docs/SETUP.jpeg" alt="SIM" width="50%">
+</p>
 
 ## Quick start
 
