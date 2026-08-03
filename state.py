@@ -7,7 +7,7 @@ from classifier import ClassifierHead, DEFAULT_HEAD_PATH
 
 def load_class_labels():
     # Startup hint only; authoritative label per prediction comes from the
-    # head live at invoke time. See pages/notes.md.
+    # head live at invoke time. See docs/modules.md.
     head = ClassifierHead.load(DEFAULT_HEAD_PATH)
     return head.labels if head else ["untrained"]
 

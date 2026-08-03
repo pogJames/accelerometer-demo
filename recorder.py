@@ -119,7 +119,7 @@ class RecordingSession:
 
 
 class RecordingManager:
-    # At most one recording session at a time. See pages/notes.md for the two-stage
+    # At most one recording session at a time. See docs/modules.md for the two-stage
     # queue and binary format.
 
     def __init__(self, data_dir: str = DATA_DIR):

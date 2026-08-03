@@ -5,6 +5,6 @@ pandas==3.0.2
 pyserial==3.5
 
 # Runtime — optional
-# TFLite: this build imports tflite_runtime (ships with NXP eIQ, not on PyPI).
-# For the Matrix800/VeriSilicon port, use ai-edge-litert instead (see README).
+# TFLite: not on PyPI, ships with the board's NPU driver. The NXP driver uses
+# tflite_runtime; the Mesa driver uses ai-edge-litert. See docs/getting-started.md.
 pyfftw

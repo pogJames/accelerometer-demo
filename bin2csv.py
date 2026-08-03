@@ -1,5 +1,5 @@
 # Convert recorder .bin (raw float32 XYZ, no header) → .csv with x,y,z header.
-# Usage in pages/notes.md.
+# Usage in docs/modules.md.
 import glob
 import os
 import sys

@@ -19,12 +19,12 @@ TURN_GRAVITY  = 8192     # raw int16 / 8192 -> G value
 SAMPLE_RATE   = 7812
 SCALE         = np.float32(1.0 / TURN_GRAVITY)   # fused int16→float32 decode
 
-READ_TIMEOUT_S          = 0.05   # see pages/notes.md for the 50 ms rationale
+READ_TIMEOUT_S          = 0.05   # see docs/modules.md for the 50 ms rationale
 RECONNECT_AFTER_FAILS   = 5      # consecutive fails → drop + reopen the port
 
 # ── Computed-metric registers (FC03 holding registers) ────────────────────
 # Each metric is its OWN FC03 read at its base address — the addresses ALIAS,
-# so a contiguous block read returns garbage. Mirrors the Rust client. pages/notes.md
+# so a contiguous block read returns garbage. Mirrors the Rust client. docs/modules.md
 REG_TEMPERATURE        = 0x0014   # 1 reg, value / 100  -> °C
 REG_GRAVITY_RMS        = 0x001E   # 3 regs (x,y,z), / 1000
 REG_GRAVITY_PEAK       = 0x001F   # 3 regs, / 1000
@@ -38,11 +38,11 @@ REG_VELOCITY_CREST     = 0x0034   # 3 regs, / 100
 REG_VELOCITY_PRIM_FREQ = 0x003C   # 1 reg, raw Hz
 
 # Poll kurtosis (slowest metric) and emit a full batch when it changes;
-# fallback forces a refresh even if it sits still. See pages/notes.md.
+# fallback forces a refresh even if it sits still. See docs/modules.md.
 KURT_POLL_INTERVAL_S = 0.4
 METRIC_FALLBACK_S    = 5.0
 # FC03 reads are slow + variable (~0.5-1 s); a premature timeout desyncs the
-# stream forever. Generous timeout + line drain to resync. pages/notes.md.
+# stream forever. Generous timeout + line drain to resync. docs/modules.md.
 METRIC_READ_TIMEOUT_S = 5.0
 METRIC_READ_RETRIES   = 3
 METRIC_READ_GAP_S     = 0.001
@@ -118,7 +118,7 @@ def reader_process_main(port, window_queue, req_q, resp_q,
                         timeout=READ_TIMEOUT_S, sample_rate=SAMPLE_RATE,
                         window_size=WINDOW_SIZE, hop_size=HOP_SIZE, max_qsize=12):
     # Subprocess entry point; owns the pyserial client + RecordingManager for
-    # one port. See pages/notes.md for the process model and arg contract.
+    # one port. See docs/modules.md for the process model and arg contract.
     #
     # `spawn` gives the child a fresh interpreter — re-apply the bundled-deps
     # path before importing project modules.

@@ -6,9 +6,10 @@ import numpy as np
 from classifier import ClassifierHead, DEFAULT_HEAD_PATH
 
 
-# PORT: change these two + the runtime import in _try_load_interpreter to
-# target another NPU. See pages/notes.md "Porting to another NPU".
-NPU_MODEL_PATH = "models/vibration_backbone_int8_vela.tflite"  # Vela int8, Ethos-U only
+# PORT: same Matrix800 NPU, two drivers. Change these two + the runtime import
+# in _try_load_interpreter to match the board's driver (NXP or Mesa). See
+# docs/getting-started.md "Choose your NPU driver".
+NPU_MODEL_PATH = "models/vibration_backbone_int8_vela.tflite"  # Vela int8, NXP/Ethos-U
 DELEGATE_PATH  = "/usr/lib/libethosu_delegate.so"             # PORT
 
 
@@ -91,7 +92,7 @@ class InferenceWorker(threading.Thread):
             raise RuntimeError("interpreter not loaded")
 
         # CLIP-before-cast: a bare cast silently wraps out-of-range values
-        # (200 -> -56), feeding the NPU garbage. See pages/notes.md.
+        # (200 -> -56), feeding the NPU garbage. See docs/architecture.md.
         if self._inp["dtype"] == np.int8:
             scale, zero_point = self._inp["quantization"]
             x = np.clip(np.round(window / scale + zero_point), -128, 127).astype(np.int8)

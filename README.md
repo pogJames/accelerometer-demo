@@ -1,52 +1,55 @@
 # accelerometer-demo
 
-**English** · [繁體中文](README.zh-TW.md)
+Real-time vibration monitor and motion classifier for the **Matrix800** gateway.
+A tri-axial accelerometer streams raw XYZ over Modbus RTU → a frozen CNN backbone
+runs on the NPU → a cosine-similarity head labels the motion → a live Flask
+dashboard shows the waveform, FFT, sensor metrics, and class.
 
-Real-time vibration monitor + classifier. A tri-axial accelerometer streams raw
-XYZ over Modbus RTU → a frozen CNN backbone extracts 128-d embeddings → a
-cosine-similarity head classifies motion → live waveform, FFT spectrum, sensor
-metrics and inference results surface in a Flask dashboard. The backbone is
-never retrained; the head is computed in seconds from your own recordings.
+![Screenshot](./docs/SETUP.jpeg)
 
-## Hardware
-
-1. Matrix 800
-2. 12–24 V power brick w/ terminal block (Matrix 800)
-3. Tri-axial accelerometer
-4. 5 V power brick (accelerometer)
-
-## Setup & launch
+## Quick start
 
 ```bash
+git clone https://github.com/pogJames/accelerometer-demo
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
-
-python app.py                   # http://localhost (port 80)
+python app.py                   # http://<board-ip>/
 ```
 
-Off the target board (no `tflite_runtime` / Ethos-U delegate) inference runs in
-`stub` mode — everything else works for development. The app auto-detects serial
-ports in `ALLOWED_PORTS` (`/dev/ttyUSB0..3`), one reader subprocess per sensor.
+On real hardware, **first set the NPU driver** — the one step that silently
+breaks if wrong. See [getting-started.md](docs/getting-started.md#3-choose-your-npu-driver).
 
 ## Pages
 
-| URL | What |
+| URL | Shows |
 |---|---|
 | `/` | Live waveform — raw scroll + FFT spectrum, per sensor |
-| `/inference` | Live classification cards (majority vote over last 7) |
+| `/inference` | Live class cards (majority vote over the last 7 windows) |
 | `/metrics` | Per-sensor metric tables (gravity / velocity / temperature) |
 | `/record` | Record raw XYZ to `data/<label>.bin` |
-| `/train` | Train the classifier head (≥ 2 labels, seconds) |
-| `/settings` | Per-port friendly aliases |
+| `/train` | Train the classifier head (2+ labels, seconds) |
+| `/settings` | Per-port friendly names |
 
-## More docs
+## Architecture in five lines
 
-| Doc | Contents |
+Three workers, decoupled by queues:
+
+```
+W1 sensor_reader.py  → queues →  W2 inference.py  →  W3 app.py
+   (subprocess per port)            (NPU classify)     (Flask + SSE)
+```
+
+W1 reads Modbus in its own process (the serial loop is GIL-bound). W2 runs the
+frozen int8 backbone on the NPU. W3 wires it together and pushes snapshots to the
+browser over SSE. Inference mode is `npu` (real) or `stub` (runtime/model/delegate
+missing — the dashboard still renders). No CPU fallback.
+
+## Docs
+
+| Doc | For |
 |---|---|
-| [architecture.md](pages/architecture.md) | Worker/data-flow diagram, dual cadence, inference modes |
-| [http-api.md](pages/http-api.md) | SSE streams + REST endpoints |
-| [pages.md](pages/pages.md) | Full per-page UI reference |
-| [tuning.md](pages/tuning.md) | Key files + tuning-knob constants |
-| [notes.md](pages/notes.md) | Per-module design rationale (the code's `See pages/notes.md`) + NPU porting |
-| [setup.md](pages/setup.md) | Board / OS image setup |
+| [getting-started.md](docs/getting-started.md) | Run it on a Matrix800 from zero |
+| [api.md](docs/api.md) | HTTP/SSE API to build on top |
+| [architecture.md](docs/architecture.md) | How and why it's built this way |
+| [modules.md](docs/modules.md) | Per-file notes for editing internals |

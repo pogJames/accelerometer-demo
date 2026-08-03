@@ -11,7 +11,7 @@ from classifier import ClassifierHead, DEFAULT_HEAD_PATH, PALETTE_SIZE
 
 WINDOW_SIZE = 2604               # must match sensor_reader.py
 MIN_WINDOWS = 6                  # 6 × 2604 = 2.0 s of recording — permissive floor
-TRAIN_HOP = WINDOW_SIZE // 4     # 75 % overlap → 4 phase alignments. See pages/notes.md.
+TRAIN_HOP = WINDOW_SIZE // 4     # 75 % overlap → 4 phase alignments. See docs/modules.md.
 
 SAMPLE_BYTES = 4 * 3            # float32 * 3 channels — must match recorder.SAMPLE_BYTES
 
@@ -185,7 +185,7 @@ class TrainerManager:
                       f"(norm={float(np.linalg.norm(proto)):.3f})")
 
             # Random colour per train (uses Python RNG, not numpy's, so external
-            # numpy seeding can't make the shuffle stable). See pages/notes.md.
+            # numpy seeding can't make the shuffle stable). See docs/modules.md.
             n = len(session.selected_labels)
             if n <= PALETTE_SIZE:
                 colors = random.sample(range(PALETTE_SIZE), n)

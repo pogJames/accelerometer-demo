@@ -7,7 +7,7 @@ import threading
 import time
 
 # Bundled deps live in ./site-packages on the embedded device. Harmless when
-# empty; spawned children re-apply it (see reader_process_main). pages/notes.md.
+# empty; spawned children re-apply it (see reader_process_main). docs/modules.md.
 current_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(current_path, "site-packages"))
 
@@ -233,7 +233,7 @@ def build_app():
         return recorders.get(p)
 
     # A reader runs if the user opened it for inference OR a recording is in
-    # progress. Tracked separately; active_events is the union. pages/notes.md.
+    # progress. Tracked separately; active_events is the union. docs/modules.md.
     active_state_lock = threading.Lock()
     inference_open = set()
     recording_ports = set()

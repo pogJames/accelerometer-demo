@@ -17,7 +17,7 @@ SAVGOL_POLYORDER = 3
 
 def _savgol_coeffs(window_length, polyorder):
     # Savitzky-Golay smoothing coeffs (centre row), zero scipy deps. Derivation
-    # in pages/notes.md; equivalent to scipy.signal.savgol_coeffs(W, P).
+    # in docs/modules.md; equivalent to scipy.signal.savgol_coeffs(W, P).
     if window_length % 2 == 0 or window_length <= polyorder:
         raise ValueError("window_length must be odd and > polyorder")
     half = window_length // 2
