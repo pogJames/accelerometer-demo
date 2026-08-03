@@ -79,4 +79,4 @@ jobs:
       - name: Run inference smoketest (CPU mode)
         env:
           FORCE_CPU: "1"
-        run: python inference_smoketest.py --runs 50
+        run: python smoketest.py --runs 50
