@@ -203,7 +203,7 @@ function handleSnapshot(data) {
 
 setMetricsActive(true);
 
-const evt = new EventSource("/api/metrics_stream");
+const evt = new EventSource("/stream/metrics");
 evt.onmessage = (e) => {
   try { handleSnapshot(JSON.parse(e.data)); }
   catch (err) { console.warn("metrics SSE parse error:", err); }

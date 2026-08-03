@@ -717,7 +717,7 @@ if (window.setLang && !window.setLang.__wfWrapped) {
 initPlots();
 activateAll(true);
 
-const evt = new EventSource("/api/waveform_stream");
+const evt = new EventSource("/stream/waveform");
 evt.onmessage = (e) => {
   try {
     handleSnapshot(JSON.parse(e.data));

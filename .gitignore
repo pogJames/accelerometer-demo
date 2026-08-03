@@ -1,5 +1,7 @@
 __pycache__
-src
+.github
+data
 
+smoketest.py
 CLAUDE.local.md
 setup.md

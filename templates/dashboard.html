@@ -43,7 +43,7 @@ const updatedEl = document.getElementById("updated");
 const tpl = document.getElementById("card-tpl");
 const portCards = new Map();
 const lastDisplaySeq = new Map();
-// label name -> color slot (0..9), populated from each /api/stream snapshot.
+// label name -> color slot (0..9), populated from each /stream/inference snapshot.
 let labelColors = {};
 
 function classFor(name) {
@@ -181,7 +181,7 @@ function handleSnapshot(data) {
   }
 }
 
-const evt = new EventSource("/api/stream");
+const evt = new EventSource("/stream/inference");
 evt.onmessage = (e) => {
   try {
     handleSnapshot(JSON.parse(e.data));

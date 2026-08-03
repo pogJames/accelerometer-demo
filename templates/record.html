@@ -146,10 +146,7 @@ const labelsEmpty = document.getElementById("labels-empty");
 
 // --- State ---
 let availablePorts = [];
-let statusES = null;
-// Tracks the previous session status so we only fire completion/cancel/error
-// toasts on the active -> terminal transition, not on every 1 Hz SSE tick.
-let prevStatus = null;
+let pollHandle = null;
 
 // --- Name input ---
 function sanitizePreview(raw) {
@@ -276,53 +273,46 @@ function renderProgress(s) {
   progressPort.textContent = s.port ? portLabel(s.port) : "—";
 }
 
-// Server-pushed status updates at strict 1 Hz over SSE. Replaces the previous
-// 2 Hz polling — fewer Flask wakeups, no per-tick HTTP overhead, no terminal
-// access-log spam during recording.
-function handleSessionUpdate(s) {
-  const curStatus = s ? s.status : null;
+// Poll /api/record/status while a recording is active, mirroring the train
+// page. Recording progress is time-gated, so a 1 Hz client poll of the cheap
+// status GET is the right cadence — no server-held SSE thread per open tab.
+async function pollStatus() {
+  const r = await fetch("/api/record/status");
+  if (!r.ok) return;
+  const { session: s } = await r.json();
 
   if (s && s.status === "active") {
     renderProgress(s);
     startBtn.disabled = true;
-  } else {
-    renderProgress(null);
-    refreshStartEnabled();
+    return;
   }
 
-  // Only react to active -> terminal transitions. Page-load with a stale
-  // _last_finished session would otherwise re-fire toasts on every reload.
-  if (prevStatus === "active" && curStatus !== "active" && s) {
-    if (curStatus === "complete") {
+  // Terminal (or no session): stop the loop and react to the outcome once.
+  // Because we only poll while active, a stale _last_finished session on
+  // page load never reaches here — no spurious reload toasts.
+  renderProgress(null);
+  stopPolling();
+  refreshStartEnabled();
+  if (s) {
+    if (s.status === "complete") {
       showToast(`Saved ${s.file_path} (${fmtNumber(s.samples_written)} samples)`);
       refreshRecordings();
-    } else if (curStatus === "cancelled") {
+    } else if (s.status === "cancelled") {
       showToast(`Cancelled — kept ${fmtNumber(s.samples_written)} samples in ${s.file_path}`);
       refreshRecordings();
-    } else if (curStatus === "error") {
+    } else if (s.status === "error") {
       showToast(`Error: ${s.error || "unknown"}`, { error: true, durationMs: 6000 });
       refreshRecordings();
     }
   }
-
-  prevStatus = curStatus;
 }
 
-function connectStatusStream() {
-  if (statusES != null) return;
-  statusES = new EventSource("/api/record/stream");
-  statusES.onmessage = (e) => {
-    try {
-      const data = JSON.parse(e.data);
-      handleSessionUpdate(data.session);
-    } catch (err) {
-      console.warn("bad SSE message:", err);
-    }
-  };
-  statusES.onerror = () => {
-    // EventSource auto-reconnects with backoff; nothing to do here beyond logging.
-    console.warn("status stream errored, EventSource will auto-reconnect");
-  };
+function startPolling() {
+  if (pollHandle != null) return;
+  pollHandle = setInterval(pollStatus, 1000);
+}
+function stopPolling() {
+  if (pollHandle != null) { clearInterval(pollHandle); pollHandle = null; }
 }
 
 // --- Start / cancel handlers ---
@@ -346,6 +336,7 @@ startBtn.addEventListener("click", async () => {
       return;
     }
     renderProgress(data.session);
+    startPolling();
   } catch (err) {
     showToast(String(err), { error: true });
     refreshStartEnabled();
@@ -399,15 +390,23 @@ labelsTable.addEventListener("click", async (e) => {
 
 cancelBtn.addEventListener("click", async () => {
   await fetch("/api/record/cancel", { method: "POST" });
-  // The next SSE tick will deliver the cancelled status and fire the toast.
+  pollStatus();  // pick up the cancelled status immediately
 });
 
 // --- Bootstrap ---
 (async function init() {
   await refreshRecordings();
-  // SSE delivers the initial state immediately, then ticks once per second.
-  // Handles the page-reload-mid-recording case without an extra fetch.
-  connectStatusStream();
+  // Pick up an in-progress recording if we landed mid-session, and only then
+  // start polling — a stale terminal session on load renders nothing and fires
+  // no toast.
+  const r = await fetch("/api/record/status");
+  if (r.ok) {
+    const { session: s } = await r.json();
+    if (s && s.status === "active") {
+      renderProgress(s);
+      startPolling();
+    }
+  }
 })();
 </script>
 {% endblock %}

@@ -215,7 +215,7 @@ def build_app():
         print(f"[app] spawned reader process for {p} (pid={proc.pid})")
 
     # Drain thread: pull metric snapshots off the cross-process queue, store
-    # the latest per port, and wake any /api/metrics_stream SSE clients.
+    # the latest per port, and wake any /stream/metrics SSE clients.
     def metrics_drain_loop():
         while True:
             try:
@@ -476,7 +476,7 @@ def build_app():
             return jsonify({"error": str(e)}), 400
         return jsonify({"port": port, "active": active})
 
-    @app.route("/api/metrics_stream")
+    @app.route("/stream/metrics")
     def metrics_stream():
         """SSE pushing the latest per-port metric snapshots. Driven by the
         drain thread's bus bump — i.e. at the slow kurtosis cadence."""
@@ -552,7 +552,7 @@ def build_app():
     def metrics():
         return jsonify(snapshot_payload())
 
-    @app.route("/api/stream")
+    @app.route("/stream/inference")
     def stream():
         def gen():
             last_seq = bus.current_seq()
@@ -570,7 +570,7 @@ def build_app():
             "X-Accel-Buffering": "no",
         })
 
-    @app.route("/api/waveform_stream")
+    @app.route("/stream/waveform")
     def waveform_stream():
         """SSE pushing per-port live waveform snapshots at ~3 Hz/port. The
         aggregator throttles publishing inside the inference loop; we just
@@ -688,29 +688,6 @@ def build_app():
             return jsonify({"error": str(e)}), 500
         release_if_finished(session)
         return jsonify({"session": session})
-
-    @app.route("/api/record/stream")
-    def record_stream():
-        # Time-driven 1 Hz tick, not event-driven like /api/stream — recording
-        # progress is gated by elapsed seconds, not by inference latches.
-        def gen():
-            while True:
-                rec = current_recorder()
-                if rec is None:
-                    session = None
-                else:
-                    try:
-                        session = rec.status()
-                    except RuntimeError:
-                        session = None
-                release_if_finished(session)
-                yield f"data: {json.dumps({'session': session})}\n\n"
-                time.sleep(1.0)
-
-        return Response(gen(), mimetype="text/event-stream", headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        })
 
     @app.route("/api/record/cancel", methods=["POST"])
     def record_cancel():

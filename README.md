@@ -71,10 +71,10 @@ W3  app.py + Flask
      /record            data recording (delete inline)
      /train             train the classifier head
      /settings          per-port alias names
-     /api/stream                 SSE — predictions
-     /api/waveform_stream        SSE — waveform snapshots (~30 Hz)
-     /api/metrics_stream         SSE — metric batches (~2-5 s)
-     /api/record/stream          SSE — recording progress
+     /stream/inference           SSE — predictions
+     /stream/waveform            SSE — waveform snapshots (~30 Hz)
+     /stream/metrics             SSE — metric batches (~2-5 s)
+     /api/record/status          JSON — recording progress (client-polled ~1 Hz)
 ```
 
 **Dual cadence in the reader.** `window_queue` carries full 2604-sample windows for the model at ~6 Hz; `raw_queue` carries small 217-sample fresh chunks for the waveform at ~36 Hz. Inference and waveform are fully decoupled — neither blocks the other.
